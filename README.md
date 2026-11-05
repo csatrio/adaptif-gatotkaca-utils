@@ -185,12 +185,13 @@ Steps:
 
 ### When it breaks
 
-`push_to_stack` and `TreiberQueue::push` are not marked `unsafe`, but they
+`push_to_stack`, `push_chain` and `TreiberQueue::push` are not marked `unsafe`, but they
 dereference the pointer you give them. They cause undefined behaviour if:
 
 - the pointer is null, dangling or misaligned,
 - the node is already in a stack or queue (its `next` is overwritten, which
   corrupts the chain),
+- any node of a `push_chain` chain has one of these problems,
 - you free or change the node while it is still in the stack or queue.
 
 When `push` returns `false` the node was not added, so you still own it and
@@ -200,6 +201,11 @@ must free it yourself.
 
 `TreiberQueue` adds an approximate size limit. `push` returns `false` when the
 queue is full; the node was not pushed and you still own it.
+
+The limit is approximate: while several threads push at once, the count can
+briefly reach `limit` plus the number of pushing threads before the rejected
+pushes subtract again. A node is never pushed unless the count was below the
+limit when it was checked.
 
 ```rust
 use std::ptr;
@@ -259,6 +265,58 @@ for job in chain.iterator() {
 assert_eq!(total, (0..400).sum::<u64>());
 assert!(queue.is_empty());
 ```
+
+### Pushing a batch with one CAS
+
+`push_chain` publishes several nodes at once: other threads see all of them or
+none, and they stay contiguous and in order. `TreiberNode::link_chain` builds
+the chain from nodes given oldest first.
+
+```rust
+use std::ptr;
+use std::sync::atomic::AtomicPtr;
+use adaptif_gatotkaca_utils::{GkTreiberPtr, GkTreiberStackIterator, TreiberNode};
+
+struct Msg {
+    next: AtomicPtr<Msg>,
+    id: u32,
+}
+
+impl TreiberNode for Msg {
+    type Value = u32;
+    fn next(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
+    fn value(&self) -> &u32 {
+        &self.id
+    }
+}
+
+let stack: AtomicPtr<Msg> = AtomicPtr::new(ptr::null_mut());
+let batch = (1..=3).map(|id| {
+    Box::into_raw(Box::new(Msg { next: AtomicPtr::new(ptr::null_mut()), id }))
+});
+
+// Oldest first in, one CAS out.
+let (first, last) = Msg::link_chain(batch).unwrap();
+stack.push_chain(first, last);
+
+let ids: Vec<u32> = stack
+    .reap_all()
+    .iterator() // oldest first
+    .map(|p| unsafe { Box::from_raw(p) }.id)
+    .collect();
+assert_eq!(ids, [1, 2, 3]);
+```
+
+`push_chain` has the same rules as `push_to_stack` for every node in the chain.
+
+### Contention
+
+Pushes back off with a short spin after a failed compare-and-swap (they never
+yield to the OS). `reap_all` on an empty stack or queue only does a load, so a
+consumer that polls often does not slow the producers down. In `TreiberQueue`,
+the head and the counter sit on separate cache lines.
 
 If several consumers share the queue, or you need an exact count, use
 `reap_all_raw()` instead. It leaves the count alone; subtract from

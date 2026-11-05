@@ -17,6 +17,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+use crossbeam_utils::{Backoff, CachePadded};
 
 // ============================================================================
 // Abstraction and traits
@@ -39,6 +40,9 @@ pub trait GkTreiberPtr<T: TreiberNode> {
     ///
     /// The returned head now owns the chain, newest node first. Use
     /// [`GkTreiberStackIterator`] to walk it.
+    ///
+    /// If the stack is already empty this only does a load, so polling an empty
+    /// stack does not take the cache line away from the producers.
     fn reap_all(&self) -> Self;
 
     /// Pushes `item_ptr` onto the stack. Safe to call from many threads at once.
@@ -50,6 +54,21 @@ pub trait GkTreiberPtr<T: TreiberNode> {
     ///   overwritten and the stack gets corrupted;
     /// - the node is freed or modified while it is still in the stack.
     fn push_to_stack(&self, item_ptr: *mut T);
+
+    /// Pushes a whole chain with one compare-and-swap.
+    ///
+    /// `first ..= last` must already be linked through `next`, with `first`
+    /// the newest node (the one that ends up at the head). `last.next` is
+    /// overwritten. Use [`TreiberNode::link_chain`] to build the chain.
+    ///
+    /// Useful to publish a batch of items at once: other threads see all of
+    /// them or none of them, and the batch stays contiguous and in order.
+    ///
+    /// Like [`push_to_stack`](Self::push_to_stack), this is not marked `unsafe`
+    /// but breaks (undefined behaviour) if any node in the chain is null,
+    /// dangling, already in another stack, or freed or modified while it is
+    /// still in the stack. `first` and `last` must belong to the same chain.
+    fn push_chain(&self, first: *mut T, last: *mut T);
 }
 
 impl<T: TreiberNode> GkTreiberPtr<T> for AtomicPtr<T> {
@@ -66,26 +85,35 @@ impl<T: TreiberNode> GkTreiberPtr<T> for AtomicPtr<T> {
     }
 
     fn reap_all(&self) -> Self {
-        let raw_ptr = self.swap(ptr::null_mut(), Ordering::AcqRel);
-        Self::new_from_raw(raw_ptr)
+        // Swapping an empty head still takes the cache line exclusively from
+        // the producers, so check first.
+        if self.load(Ordering::Relaxed).is_null() {
+            return AtomicPtr::new(ptr::null_mut());
+        }
+        Self::new_from_raw(self.swap(ptr::null_mut(), Ordering::AcqRel))
     }
 
     fn push_to_stack(&self, item_ptr: *mut T) {
-        let mut current_head = self.load(Ordering::Acquire);
+        self.push_chain(item_ptr, item_ptr);
+    }
+
+    fn push_chain(&self, first: *mut T, last: *mut T) {
+        // A push that succeeds first time never calls the backoff. `spin` (not
+        // `snooze`) so a lock-free push never yields its time slice to the OS.
+        let backoff = Backoff::new();
+        // The head is only stored into our own node, never dereferenced, so
+        // Relaxed is enough here and on CAS failure.
+        let mut head = self.load(Ordering::Relaxed);
         loop {
-            // Safety: item_ptr is assumed to be exclusively owned here.
-            unsafe { (*item_ptr).next().store(current_head, Ordering::Relaxed) };
-            // BRANCH: Attempt atomic CAS to push item onto stack
-            match self.compare_exchange_weak(
-                current_head,
-                item_ptr,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                // BRANCH: CAS succeeded, item pushed to stack head
-                Ok(_) => break,
-                // BRANCH: CAS failed due to concurrent update, retry with new head snapshot
-                Err(h) => current_head = h,
+            // Safety: the caller owns the chain exclusively until the CAS succeeds.
+            unsafe { (*last).next().store(head, Ordering::Relaxed) };
+            // Release on success publishes the nodes' `next` and payload to the reaper.
+            match self.compare_exchange_weak(head, first, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(h) => {
+                    head = h;
+                    backoff.spin();
+                }
             }
         }
     }
@@ -105,6 +133,30 @@ pub trait TreiberNode {
 
     /// Returns the node's data.
     fn value(&self) -> &Self::Value;
+
+    /// Links nodes into a chain for [`GkTreiberPtr::push_chain`].
+    ///
+    /// `nodes` is given in push order, oldest first. Returns `Some((first, last))`
+    /// to pass to `push_chain`, or `None` if `nodes` is empty. After pushing,
+    /// [`GkTreiberStackIterator::iterator`] yields the nodes in the order given.
+    ///
+    /// Every pointer must be valid and not in any stack, and nothing else may
+    /// touch these nodes while they are linked.
+    fn link_chain(nodes: impl IntoIterator<Item = *mut Self>) -> Option<(*mut Self, *mut Self)>
+    where
+        Self: Sized,
+    {
+        let mut nodes = nodes.into_iter();
+        let oldest = nodes.next()?;
+        // Safety: the caller guarantees the pointers are valid and unshared.
+        unsafe { (*oldest).next().store(ptr::null_mut(), Ordering::Relaxed) };
+        let mut newest = oldest;
+        for node in nodes {
+            unsafe { (*node).next().store(newest, Ordering::Relaxed) };
+            newest = node;
+        }
+        Some((newest, oldest))
+    }
 
     /// Reverses a chain in place and counts its nodes.
     ///
@@ -253,10 +305,13 @@ impl<N: TreiberNode> GkTreiberStackIterator<N> for AtomicPtr<N> {
 /// [`reap_all`](Self::reap_all) (which resets the count) or
 /// [`reap_all_raw`](Self::reap_all_raw) (which leaves the count for the
 /// consumer to decrement through [`grab_counter`](Self::grab_counter)).
+///
+/// `head` and `count` sit on separate cache lines, so counting and pushing do
+/// not slow each other down.
 #[derive(Debug)]
 pub struct TreiberQueue<N> {
-    head: AtomicPtr<N>,
-    count: AtomicUsize,
+    head: CachePadded<AtomicPtr<N>>,
+    count: CachePadded<AtomicUsize>,
     limit: usize,
 }
 
@@ -264,8 +319,8 @@ impl<N: TreiberNode> TreiberQueue<N> {
     /// Creates an empty queue that holds about `limit` items.
     pub fn new(limit: usize) -> Self {
         Self {
-            head: <AtomicPtr<N> as GkTreiberPtr<N>>::new(),
-            count: AtomicUsize::new(0),
+            head: CachePadded::new(<AtomicPtr<N> as GkTreiberPtr<N>>::new()),
+            count: CachePadded::new(AtomicUsize::new(0)),
             limit,
         }
     }
@@ -275,6 +330,11 @@ impl<N: TreiberNode> TreiberQueue<N> {
     /// Returns `true` if it was pushed. Returns `false` if the queue is full;
     /// the item was not pushed and the caller still owns it.
     ///
+    /// The limit is approximate. Under a race the count can briefly reach
+    /// `limit` plus the number of threads pushing at that moment, before the
+    /// rejected pushes subtract again. An item is never pushed unless the
+    /// count was below `limit` when it was checked.
+    ///
     /// This function is not marked `unsafe`, but it dereferences `item_ptr`.
     /// It breaks (undefined behaviour) when:
     /// - `item_ptr` is null, dangling, or not properly aligned;
@@ -282,37 +342,13 @@ impl<N: TreiberNode> TreiberQueue<N> {
     ///   overwritten and the chain gets corrupted;
     /// - the node is freed or modified while it is still in the queue.
     pub fn push(&self, item_ptr: *mut N) -> bool {
-        let mut count = self.count.load(Ordering::Acquire);
-        loop {
-            if count >= self.limit {
-                return false;
-            }
-            match self.count.compare_exchange_weak(
-                count,
-                count + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(c) => count = c,
-            }
+        // One fetch_add that cannot fail, instead of a CAS retry loop. The
+        // limit is approximate anyway, and the items are ordered by `head`.
+        if self.count.fetch_add(1, Ordering::Relaxed) >= self.limit {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            return false;
         }
-
-        let mut head = self.head.load(Ordering::Acquire);
-        loop {
-            // Safety: item_ptr is assumed to be exclusively owned here.
-            unsafe { (*item_ptr).next().store(head, Ordering::Relaxed) };
-            match self.head.compare_exchange_weak(
-                head,
-                item_ptr,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(h) => head = h,
-            }
-        }
-
+        self.head.push_to_stack(item_ptr);
         true
     }
 
@@ -335,7 +371,11 @@ impl<N: TreiberNode> TreiberQueue<N> {
     /// need an exact count.
     pub fn reap_all(&self) -> AtomicPtr<N> {
         let head = self.head.reap_all();
-        self.count.store(0, Ordering::Release);
+        // Skip the store when the count is already 0, so a consumer polling an
+        // idle queue does not take the counter's cache line from the producers.
+        if self.count.load(Ordering::Relaxed) != 0 {
+            self.count.store(0, Ordering::Release);
+        }
         head
     }
 
