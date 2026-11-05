@@ -213,25 +213,77 @@ pub trait TreiberNode {
 /// Each yielded pointer has its `next` cleared, and the caller now owns it.
 /// Nodes not yet yielded when the iterator is dropped are freed with
 /// [`TreiberNode::drop_node`].
+///
+/// The iterator owns its chain exclusively, so it walks it with plain loads
+/// and stores and no atomic read-modify-write.
+///
+/// It is `Send` only if the node type is `Send`, and never `Sync`:
+///
+/// ```
+/// use std::sync::atomic::AtomicPtr;
+/// use adaptif_gatotkaca_utils::{TreiberNode, TreiberStackIterator};
+///
+/// struct Node { next: AtomicPtr<Node>, value: u32 }
+/// impl TreiberNode for Node {
+///     type Value = u32;
+///     fn next(&self) -> &AtomicPtr<Self> { &self.next }
+///     fn value(&self) -> &u32 { &self.value }
+/// }
+///
+/// fn assert_send<T: Send>() {}
+/// assert_send::<TreiberStackIterator<Node>>();
+/// ```
+///
+/// A node holding an `Rc` is not `Send`, so its iterator can't move to another thread:
+///
+/// ```compile_fail
+/// use std::{rc::Rc, sync::atomic::AtomicPtr};
+/// use adaptif_gatotkaca_utils::{TreiberNode, TreiberStackIterator};
+///
+/// struct Node { next: AtomicPtr<Node>, value: Rc<u32> }
+/// impl TreiberNode for Node {
+///     type Value = Rc<u32>;
+///     fn next(&self) -> &AtomicPtr<Self> { &self.next }
+///     fn value(&self) -> &Rc<u32> { &self.value }
+/// }
+///
+/// fn assert_send<T: Send>() {}
+/// assert_send::<TreiberStackIterator<Node>>();
+/// ```
 pub struct TreiberStackIterator<N: TreiberNode> {
-    curr: AtomicPtr<N>,
+    curr: *mut N,
+}
+
+// Safety: the iterator owns the chain; moving it moves the nodes and their values.
+// Not `Sync`: `next` takes `&mut self`, so there is nothing to share.
+unsafe impl<N: TreiberNode + Send> Send for TreiberStackIterator<N> {}
+
+impl<N: TreiberNode> TreiberStackIterator<N> {
+    /// Creates an iterator that yields the chain starting at `head`, in chain order.
+    ///
+    /// # Safety
+    ///
+    /// `head` must be null or the head of a chain the caller owns exclusively
+    /// (for example one returned by `reap_all`). Every node in it must be valid.
+    pub unsafe fn from_head(head: *mut N) -> Self {
+        Self { curr: head }
+    }
 }
 
 impl<N: TreiberNode> Iterator for TreiberStackIterator<N> {
     type Item = *mut N;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let ptr = self.curr.swap(ptr::null_mut(), Ordering::Relaxed);
+        let ptr = self.curr;
         if ptr.is_null() {
             return None;
         }
 
-        // Safety: ptr is assumed to be valid since the queue was not empty
-        let next_obj = unsafe { (*ptr).next() };
-
-        // Clear the next pointer of the yielded element and advance curr
-        let next_ptr = next_obj.swap(ptr::null_mut(), Ordering::Relaxed);
-        self.curr.store(next_ptr, Ordering::Relaxed);
+        // Safety: nodes of a reaped chain are valid and owned by the iterator.
+        let link = unsafe { (*ptr).next() };
+        self.curr = link.load(Ordering::Relaxed);
+        // The yielded node must not point back into the chain.
+        link.store(ptr::null_mut(), Ordering::Relaxed);
 
         Some(ptr)
     }
@@ -239,13 +291,14 @@ impl<N: TreiberNode> Iterator for TreiberStackIterator<N> {
 
 impl<N: TreiberNode> Drop for TreiberStackIterator<N> {
     fn drop(&mut self) {
-        let mut ptr = self.curr.swap(ptr::null_mut(), Ordering::Relaxed);
+        let mut ptr = self.curr;
+        self.curr = ptr::null_mut();
 
         while !ptr.is_null() {
-            let next_obj = unsafe { (*ptr).next() };
-
-            // Cleanly sever the node links
-            let next_ptr = next_obj.swap(ptr::null_mut(), Ordering::Relaxed);
+            // Safety: unyielded nodes are valid and owned by the iterator.
+            let link = unsafe { (*ptr).next() };
+            let next_ptr = link.load(Ordering::Relaxed);
+            link.store(ptr::null_mut(), Ordering::Relaxed);
 
             // Deallocate or return unconsumed node
             unsafe {
@@ -271,26 +324,15 @@ pub trait GkTreiberStackIterator<N: TreiberNode> {
 
 impl<N: TreiberNode> GkTreiberStackIterator<N> for AtomicPtr<N> {
     fn iterator(self) -> TreiberStackIterator<N> {
-        let mut prev = ptr::null_mut();
-        let mut curr = self.load(Ordering::Relaxed);
-
-        while !curr.is_null() {
-            let next_obj = unsafe { (*curr).next() };
-
-            // Re-link the current node to prev and advance
-            let next_ptr = next_obj.swap(prev, Ordering::Relaxed);
-
-            prev = curr;
-            curr = next_ptr;
-        }
-
-        TreiberStackIterator {
-            curr: <AtomicPtr<N> as GkTreiberPtr<N>>::new_from_raw(prev),
-        }
+        // The chain is ours after `reap_all`: plain loads and stores, no RMW per node.
+        let (head, _tail, _count) = N::reverse_in_place(self.into_inner());
+        // Safety: `self` was passed by value, so nothing else can reach the chain.
+        unsafe { TreiberStackIterator::from_head(head) }
     }
 
     fn reversed_iterator(self) -> TreiberStackIterator<N> {
-        TreiberStackIterator { curr: self }
+        // Safety: `self` was passed by value, so nothing else can reach the chain.
+        unsafe { TreiberStackIterator::from_head(self.into_inner()) }
     }
 }
 

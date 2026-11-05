@@ -68,5 +68,29 @@ fn bench(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench);
+/// One thread pushes 10k nodes; then the reaper takes them and walks the chain.
+fn walk(c: &mut Criterion) {
+    const N: usize = 10_000;
+    c.bench_function("reap_and_iterate/10k", |b| {
+        b.iter_batched(
+            || {
+                let stack: AtomicPtr<Node> = AtomicPtr::new(ptr::null_mut());
+                nodes(N).into_iter().for_each(|p| stack.push_to_stack(p));
+                stack
+            },
+            |stack| {
+                // Walks the whole chain; iterator() frees nothing until a node is dropped here.
+                let mut count = 0;
+                for p in stack.reap_all().iterator() {
+                    count += 1;
+                    drop(unsafe { Box::from_raw(p) });
+                }
+                assert_eq!(count, N);
+            },
+            BatchSize::LargeInput,
+        )
+    });
+}
+
+criterion_group!(benches, bench, walk);
 criterion_main!(benches);
