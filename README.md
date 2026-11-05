@@ -16,7 +16,7 @@ developed by [PT Adaptif Sinergi Dinamis](https://adaptif.co.id/).
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-utils = "0.1"
+adaptif-gatotkaca-utils = "0.11"
 ```
 
 ## FastU64Map
@@ -57,10 +57,14 @@ Steps:
 
 1. Add a counter field (usually `AtomicU32`) to your type.
 2. Implement `GkIntrinsicRefCounted` for it.
-3. Allocate the object with `Box::into_raw` and wrap it with `GkRefCounted::new`.
-   The count starts at 1.
+3. Allocate the object with `Box::into_raw` and wrap it with
+   `unsafe { GkRefCounted::new(ptr) }`. The count starts at 1.
 4. `clone()` adds a reference, and dropping a handle removes one. The last
-   handle drops the object and frees its memory.
+   handle calls `release`, which by default drops the object and frees it with
+   `Box`.
+
+`GkRefCounted<T>` is `Send` and `Sync` only when `T` is both, like `Arc`. It
+has no `DerefMut`, so safe code can never get two `&mut` to the same object.
 
 ```rust
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -88,7 +92,11 @@ impl GkIntrinsicRefCounted for Connection {
 
 // The pointer must come from Box::into_raw, because the last handle frees it with Box.
 let raw = Box::into_raw(Box::new(Connection { ref_count: AtomicU32::new(0), id: 7 }));
-let conn = GkRefCounted::new(raw);
+// Safety: `raw` is a fresh Box pointer that no other GkRefCounted manages.
+let mut conn = unsafe { GkRefCounted::new(raw) };
+
+// You hold the only handle, so safe mutable access is allowed.
+GkRefCounted::get_mut(&mut conn).unwrap().id = 7;
 
 // Share it with another thread.
 let for_thread = conn.clone();
@@ -102,13 +110,61 @@ assert_eq!(conn.get_ref_count(Ordering::Relaxed), 1);
 
 // Round-trip through a raw pointer without changing the count.
 let ptr = conn.into_raw();
-let conn = GkRefCounted::from_raw(ptr);
+// Safety: `ptr` came from `into_raw`, so the count already includes this handle.
+let conn = unsafe { GkRefCounted::from_raw(ptr) };
 assert_eq!(conn.id, 7);
 // `conn` is the last handle, so dropping it frees the Connection.
 ```
 
-Mutable access (`as_mut`, `DerefMut`) is not checked. Only use it when no other
-handle is reading or writing the object at the same time.
+### Mutable access
+
+- `GkRefCounted::get_mut(&mut handle)` returns `Some(&mut T)` only when this is
+  the only handle, like `Arc::get_mut`. It is safe.
+- For state that many handles change, put atomics or a lock inside `T`.
+- `unsafe { handle.as_mut() }` skips the check. Use it only when you can
+  guarantee nothing else touches the object while the reference is alive.
+
+### Custom release (arenas, slabs)
+
+By default the last handle frees the object with `Box`. If your objects live in
+an arena or slab, override `release` so the memory goes back where it came from:
+
+```rust
+use std::sync::atomic::{AtomicU32, Ordering};
+use adaptif_gatotkaca_utils::{GkIntrinsicRefCounted, GkRefCounted};
+
+struct Header {
+    ref_count: AtomicU32,
+}
+
+impl GkIntrinsicRefCounted for Header {
+    fn set_ref_count(&self, val: u32, ordering: Ordering) {
+        self.ref_count.store(val, ordering)
+    }
+    fn inc_ref_count(&self, ordering: Ordering) -> u32 {
+        self.ref_count.fetch_add(1, ordering)
+    }
+    fn dec_ref_count(&self, ordering: Ordering) -> u32 {
+        self.ref_count.fetch_sub(1, ordering)
+    }
+    fn get_ref_count(&self, ordering: Ordering) -> u32 {
+        self.ref_count.load(ordering)
+    }
+
+    // Called once, by the last handle. Do not use `ptr` afterwards.
+    unsafe fn release(ptr: *mut Self) {
+        // Run the destructor, then give the slot back to your arena here,
+        // for example `arena.free(ptr)`. This sketch only runs the destructor.
+        unsafe { std::ptr::drop_in_place(ptr) };
+    }
+}
+
+// The slot lives outside Box (here: leaked, standing in for arena memory).
+let slot: &'static mut Header = Box::leak(Box::new(Header { ref_count: AtomicU32::new(0) }));
+// Safety: the slot is valid, and `release` does not free it with Box.
+let handle = unsafe { GkRefCounted::new(slot) };
+drop(handle); // calls Header::release
+```
 
 ## Treiber stack and TreiberQueue
 
@@ -126,6 +182,19 @@ Steps:
 4. Reap, then iterate. Each yielded pointer is yours: turn it back into a
    `Box` with `Box::from_raw`. Nodes left over when the iterator is dropped are
    freed for you with `TreiberNode::drop_node`.
+
+### When it breaks
+
+`push_to_stack` and `TreiberQueue::push` are not marked `unsafe`, but they
+dereference the pointer you give them. They cause undefined behaviour if:
+
+- the pointer is null, dangling or misaligned,
+- the node is already in a stack or queue (its `next` is overwritten, which
+  corrupts the chain),
+- you free or change the node while it is still in the stack or queue.
+
+When `push` returns `false` the node was not added, so you still own it and
+must free it yourself.
 
 ### Bounded queue with many producers
 
@@ -243,8 +312,12 @@ assert!(stack.is_empty());
 `GkRefCounted` and the Treiber stack work with raw pointers, and the compiler
 can't check how you use them. You must:
 
-- allocate objects and nodes with `Box::into_raw` (or override
-  `TreiberNode::drop_node` if you allocate another way),
+- allocate objects with `Box::into_raw`, or override
+  `GkIntrinsicRefCounted::release` if you allocate another way,
+- allocate Treiber nodes with `Box::into_raw`, or override
+  `TreiberNode::drop_node`,
+- call `GkRefCounted::new` and `from_raw` (both `unsafe`) only with pointers that
+  meet their `# Safety` docs,
 - never push a node that is already in a stack,
 - never use a pointer after the last handle or the consumer has freed it.
 

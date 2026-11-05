@@ -43,8 +43,12 @@ pub trait GkTreiberPtr<T: TreiberNode> {
 
     /// Pushes `item_ptr` onto the stack. Safe to call from many threads at once.
     ///
-    /// `item_ptr` must be valid and not in any other stack. Its `next` pointer
-    /// is overwritten.
+    /// This function is not marked `unsafe`, but it dereferences `item_ptr`.
+    /// It breaks (undefined behaviour) when:
+    /// - `item_ptr` is null, dangling, or not properly aligned;
+    /// - the node is already in a stack, since its `next` pointer is
+    ///   overwritten and the stack gets corrupted;
+    /// - the node is freed or modified while it is still in the stack.
     fn push_to_stack(&self, item_ptr: *mut T);
 }
 
@@ -270,6 +274,13 @@ impl<N: TreiberNode> TreiberQueue<N> {
     ///
     /// Returns `true` if it was pushed. Returns `false` if the queue is full;
     /// the item was not pushed and the caller still owns it.
+    ///
+    /// This function is not marked `unsafe`, but it dereferences `item_ptr`.
+    /// It breaks (undefined behaviour) when:
+    /// - `item_ptr` is null, dangling, or not properly aligned;
+    /// - the node is already in a queue or stack, since its `next` pointer is
+    ///   overwritten and the chain gets corrupted;
+    /// - the node is freed or modified while it is still in the queue.
     pub fn push(&self, item_ptr: *mut N) -> bool {
         let mut count = self.count.load(Ordering::Acquire);
         loop {
