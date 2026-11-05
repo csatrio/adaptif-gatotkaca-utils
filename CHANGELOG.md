@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Re-export the dependencies `crossbeam_utils` and `nohash_hasher` at the crate root.
+
 ## 0.11.2
 
 - Reaper-side iterators no longer use atomic swaps. `iterator()` reverses the

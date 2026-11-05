@@ -19,6 +19,20 @@ developed by [PT Adaptif Sinergi Dinamis](https://adaptif.co.id/).
 adaptif-gatotkaca-utils = "0.11"
 ```
 
+The crate re-exports its dependencies, `crossbeam_utils` and `nohash_hasher`,
+so you can use them without adding them to your own `Cargo.toml`. This also
+guarantees you get the same versions the public types use:
+
+```rust
+use adaptif_gatotkaca_utils::crossbeam_utils::CachePadded;
+use adaptif_gatotkaca_utils::nohash_hasher::IsEnabled;
+
+let padded = CachePadded::new(1u64);
+assert_eq!(*padded, 1);
+fn takes_key<K: IsEnabled>(_: K) {}
+takes_key(5u64);
+```
+
 ## FastU64Map
 
 A `HashMap<u64, V>` that uses each key as its own hash, so there is no SipHash

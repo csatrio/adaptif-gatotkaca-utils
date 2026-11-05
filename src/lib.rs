@@ -11,6 +11,14 @@
 //! - [`fast_hashmap`]: [`FastU64Map`], a `HashMap` keyed by `u64` that skips hashing.
 //! - [`refcounted`]: [`GkRefCounted`], an `Arc`-like pointer with an intrusive reference count.
 //! - [`treiber_stack`]: lock-free Treiber stack helpers and a bounded [`TreiberQueue`].
+//!
+//! The crate's dependencies, [`crossbeam_utils`] and [`nohash_hasher`], are
+//! re-exported at the root, so you can use them without depending on them yourself.
+
+// Re-exported so dependents use the exact versions this crate's public types
+// are built on, without adding their own dependency (or risking a mismatch).
+pub use crossbeam_utils;
+pub use nohash_hasher;
 
 pub mod fast_hashmap;
 pub mod refcounted;
