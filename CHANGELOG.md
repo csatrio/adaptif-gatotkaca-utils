@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.3
 
 - Re-export the dependencies `crossbeam_utils` and `nohash_hasher` at the crate root.
 

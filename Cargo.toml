@@ -1,6 +1,6 @@
 [package]
 name = "adaptif-gatotkaca-utils"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Low-level building blocks used by the adaptif-gatotkaca transport system: a no-hash u64 map, intrusive ref-counted pointers, and a lock-free Treiber stack."
