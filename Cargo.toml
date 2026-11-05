@@ -1,0 +1,17 @@
+[package]
+name = "adaptif-gatotkaca-utils"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Low-level building blocks used by the adaptif-gatotkaca transport system: a no-hash u64 map, intrusive ref-counted pointers, and a lock-free Treiber stack."
+license = "MIT OR Apache-2.0"
+homepage = "https://adaptif.co.id/"
+repository = "https://github.com/csatrio/adaptif-gatotkaca-utils"
+documentation = "https://docs.rs/adaptif-gatotkaca-utils"
+readme = "README.md"
+keywords = ["lock-free", "treiber", "refcount", "hashmap", "atomic"]
+categories = ["data-structures", "concurrency"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
+nohash-hasher = "0.2.0"
