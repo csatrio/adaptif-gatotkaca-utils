@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.4
+
+- `reap_all` takes the head with an `Acquire` swap instead of `AcqRel`. The
+  swap only stores null, so it has nothing to release; the pushes' `Release`
+  CAS operations form one release sequence that the swap acquires.
+- `is_empty`, `TreiberQueue::len` and the count reset in `TreiberQueue::reap_all`
+  use `Relaxed`. These values are hints and never made node data visible.
+- The module docs describe the memory ordering of the stack.
+- Added a concurrent publish test that also runs under Miri.
+
 ## 0.11.3
 
 - Re-export the dependencies `crossbeam_utils` and `nohash_hasher` at the crate root.

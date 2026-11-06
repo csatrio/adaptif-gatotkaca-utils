@@ -12,6 +12,22 @@
 //!
 //! All nodes are passed as raw pointers. A pushed node must be valid, must not
 //! be in another stack, and must stay alive until it is taken off again.
+//!
+//! # Memory ordering
+//!
+//! - A push writes the node (payload and `next`), then publishes it with a
+//!   `Release` compare-and-swap on the head.
+//! - [`reap_all`](GkTreiberPtr::reap_all) takes the head with an `Acquire`
+//!   swap. Every successful push is a read-modify-write on the head, so all
+//!   pushes in the taken chain form one release sequence, and the swap sees the
+//!   writes of every node in the chain, not only the newest.
+//! - Once taken, the chain belongs to one thread. Walking, reversing and
+//!   linking chains use `Relaxed` loads and stores. These compile to plain
+//!   loads and stores, and unlike non-atomic access they stop the compiler
+//!   from caching or reordering `next` in ways that were measured to slow
+//!   pointer-chasing loops down.
+//! - Everything else (`is_empty`, the [`TreiberQueue`] count) is only a hint
+//!   and uses `Relaxed`. Never use them to decide that a node's data is visible.
 
 use core::{
     ptr,
@@ -81,7 +97,8 @@ impl<T: TreiberNode> GkTreiberPtr<T> for AtomicPtr<T> {
     }
 
     fn is_empty(&self) -> bool {
-        self.load(Ordering::Acquire).is_null()
+        // A hint only: `reap_all` does the acquire that makes the nodes visible.
+        self.load(Ordering::Relaxed).is_null()
     }
 
     fn reap_all(&self) -> Self {
@@ -90,7 +107,9 @@ impl<T: TreiberNode> GkTreiberPtr<T> for AtomicPtr<T> {
         if self.load(Ordering::Relaxed).is_null() {
             return AtomicPtr::new(ptr::null_mut());
         }
-        Self::new_from_raw(self.swap(ptr::null_mut(), Ordering::AcqRel))
+        // Acquire pairs with the pushes' Release CAS. The swap only stores null,
+        // so it publishes nothing and needs no Release half.
+        Self::new_from_raw(self.swap(ptr::null_mut(), Ordering::Acquire))
     }
 
     fn push_to_stack(&self, item_ptr: *mut T) {
@@ -140,8 +159,8 @@ pub trait TreiberNode {
     /// to pass to `push_chain`, or `None` if `nodes` is empty. After pushing,
     /// [`GkTreiberStackIterator::iterator`] yields the nodes in the order given.
     ///
-    /// Every pointer must be valid and not in any stack, and nothing else may
-    /// touch these nodes while they are linked.
+    /// Every pointer must be valid, appear only once, and not be in any stack.
+    /// Nothing else may touch these nodes while they are linked.
     fn link_chain(nodes: impl IntoIterator<Item = *mut Self>) -> Option<(*mut Self, *mut Self)>
     where
         Self: Sized,
@@ -214,8 +233,9 @@ pub trait TreiberNode {
 /// Nodes not yet yielded when the iterator is dropped are freed with
 /// [`TreiberNode::drop_node`].
 ///
-/// The iterator owns its chain exclusively, so it walks it with plain loads
-/// and stores and no atomic read-modify-write.
+/// The iterator owns its chain exclusively, so it walks it with `Relaxed` loads
+/// and stores (plain loads and stores on x86 and ARM) and no atomic
+/// read-modify-write.
 ///
 /// It is `Send` only if the node type is `Send`, and never `Sync`:
 ///
@@ -385,7 +405,8 @@ impl<N: TreiberNode> TreiberQueue<N> {
     /// - the node is freed or modified while it is still in the queue.
     pub fn push(&self, item_ptr: *mut N) -> bool {
         // One fetch_add that cannot fail, instead of a CAS retry loop. The
-        // limit is approximate anyway, and the items are ordered by `head`.
+        // limit is approximate anyway. Relaxed is enough: the count publishes
+        // no data, the Release CAS in `push_to_stack` does.
         if self.count.fetch_add(1, Ordering::Relaxed) >= self.limit {
             self.count.fetch_sub(1, Ordering::Relaxed);
             return false;
@@ -415,8 +436,9 @@ impl<N: TreiberNode> TreiberQueue<N> {
         let head = self.head.reap_all();
         // Skip the store when the count is already 0, so a consumer polling an
         // idle queue does not take the counter's cache line from the producers.
+        // Relaxed: the count publishes no data (see `len`).
         if self.count.load(Ordering::Relaxed) != 0 {
-            self.count.store(0, Ordering::Release);
+            self.count.store(0, Ordering::Relaxed);
         }
         head
     }
@@ -431,8 +453,11 @@ impl<N: TreiberNode> TreiberQueue<N> {
     }
 
     /// Returns the approximate number of items in the queue.
+    ///
+    /// This is a hint only. A non-zero count does not make any item visible
+    /// to this thread; take the items with `reap_all` or `reap_all_raw`.
     pub fn len(&self) -> usize {
-        self.count.load(Ordering::Acquire)
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Returns true if the count is 0.
