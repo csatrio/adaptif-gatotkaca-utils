@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.14.0
+
+- Job nodes no longer record their producer: a node is a link and the payload (16 bytes for a `u64`, was 24), so an
+  idle sender holds about 65 KiB instead of 97 and a queued `u64` costs 15.7 bytes. The receiver knows whose chain it
+  is draining, so the return batch is a slice of that chain and `pop` writes nothing to a node: every `return_batch`
+  pops, or when the chain runs out, the slice goes home with one compare-and-swap. Nodes come home in chain order
+  rather than newest-first. Measured 10 to 15 percent more throughput with 2 to 6 producers (FIFO 277 to 286 M msgs/s,
+  lifo 429 to 454).
+
 ## 0.13.0
 
 - `GkTreiberChannelConfig::lifo` (`with_lifo`): the receiver hands each producer's chain out newest-first instead of

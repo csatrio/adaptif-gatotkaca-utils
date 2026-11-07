@@ -329,24 +329,16 @@ unsafe fn free_value<X, M: GkChannelMemory>(memory: &M, ptr: *mut X) {
 
 // ==== Node Definition ====
 
-/// One job slot. Lives in a thread channel's slab or in one of the chunks it grew into; freed with the channel.
+/// One job slot: a link and the payload, nothing else (a `u64` job is 16 bytes, eight to a 128-byte line). Lives in
+/// a thread channel's slab or in one of the chunks it grew into; freed with the channel. The node does not record its
+/// producer: the receiver takes a whole chain from one outbox at a time and knows whose it is.
 struct GkJobNode<T, M: GkChannelMemory> {
     next: AtomicPtr<GkJobNode<T, M>>,
-    /// The thread channel this node goes home to.
-    home: *const GkThreadChannel<T, M>,
     /// Initialised from the send until the receiver moves it out; uninitialised everywhere else.
     payload: MaybeUninit<T>,
 }
 
-impl<T, M: GkChannelMemory> GkJobNode<T, M> {
-    /// The thread channel this node goes home to.
-    #[inline(always)]
-    fn channel(&self) -> *const GkThreadChannel<T, M> {
-        self.home
-    }
-}
-
-/// Writes `len` empty nodes of `channel` at `base`, chained `base[0] -> base[1] -> ... -> tail`. Returns `base` (or
+/// Writes `len` empty nodes at `base`, chained `base[0] -> base[1] -> ... -> tail`. Returns `base` (or
 /// `tail` when `len` is 0).
 ///
 /// # Safety
@@ -354,7 +346,6 @@ impl<T, M: GkChannelMemory> GkJobNode<T, M> {
 unsafe fn link_nodes<T, M: GkChannelMemory>(
     base: *mut GkJobNode<T, M>,
     len: usize,
-    channel: *const GkThreadChannel<T, M>,
     tail: *mut GkJobNode<T, M>,
 ) -> *mut GkJobNode<T, M> {
     for i in 0..len {
@@ -363,7 +354,6 @@ unsafe fn link_nodes<T, M: GkChannelMemory>(
             let next = if i + 1 < len { base.add(i + 1) } else { tail };
             base.add(i).write(GkJobNode {
                 next: AtomicPtr::new(next),
-                home: channel,
                 payload: MaybeUninit::uninit(),
             });
         }
@@ -929,7 +919,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
         };
         // The channel exists first, so the slab is built and chained into the local list in one pass.
         // Safety: the slab is fresh and holds `nodes` nodes.
-        let local = unsafe { link_nodes(slab, nodes, channel, ptr::null_mut()) };
+        let local = unsafe { link_nodes(slab, nodes, ptr::null_mut()) };
         self.shared.senders.fetch_add(1, Ordering::Relaxed);
         // Release (inside the push) publishes the initialised channel to the receiver.
         self.shared.registry.push_to_stack(channel);
@@ -1114,14 +1104,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
         chunks.store(chunk, Ordering::Relaxed);
         self.allocated += len;
         // Safety: as above.
-        Some(unsafe {
-            link_nodes(
-                chunk_nodes::<T, M>(chunk),
-                len,
-                self.channel,
-                ptr::null_mut(),
-            )
-        })
+        Some(unsafe { link_nodes(chunk_nodes::<T, M>(chunk), len, ptr::null_mut()) })
     }
 
     /// Frees the chunks this sender grew into whose nodes are all at home (not sent, or sent and received), and
@@ -1283,11 +1266,14 @@ impl<T, W: GkWaker, M: GkChannelMemory> Drop for GkSender<T, W, M> {
 
 // ==== Receiver Definition ====
 
-/// Emptied nodes of one thread channel, waiting to go home together: `first -> ... -> last`, newest first.
+/// The emptied part of the current chain, waiting to go home together. A chain is one producer's nodes, already linked
+/// in pop order, so the batch is just a slice of it: `first` up to the node popped last, `count` nodes. Nothing is
+/// written to a node until the batch goes home, when the last node's `next` is pointed at the inbox.
 struct GkReturnBatch<T, M: GkChannelMemory> {
+    /// The producer the current chain came from.
     channel: *const GkThreadChannel<T, M>,
+    /// First node popped since the last return; the receiver's `head` is the node after the batch.
     first: *mut GkJobNode<T, M>,
-    last: *mut GkJobNode<T, M>,
     count: usize,
 }
 
@@ -1295,7 +1281,6 @@ impl<T, M: GkChannelMemory> GkReturnBatch<T, M> {
     const EMPTY: Self = Self {
         channel: ptr::null(),
         first: ptr::null_mut(),
-        last: ptr::null_mut(),
         count: 0,
     };
 }
@@ -1530,7 +1515,8 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
 }
 
 impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
-    /// Moves the next value out of its node and sends the node home (in a batch).
+    /// Moves the next value out of its node. The node goes home with its batch: every `return_batch` pops, and when the
+    /// chain runs out, so an idle receiver holds no node. Order within a batch is whatever the chain's is.
     #[inline(always)]
     fn pop(&mut self) -> Option<T> {
         let node = self.head;
@@ -1539,67 +1525,31 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             return None;
         }
         // Safety: chain nodes are valid, owned by this receiver and hold a payload, which is read once here.
-        let value = unsafe {
-            self.head = (*node).next.load(Ordering::Relaxed);
-            ptr::read((*node).payload.as_ptr())
+        let (next, value) = unsafe {
+            (
+                (*node).next.load(Ordering::Relaxed),
+                ptr::read((*node).payload.as_ptr()),
+            )
         };
-        // Safety: the node is empty now and ours.
-        unsafe { self.recycle(node) };
+        self.head = next;
         self.chain_len += 1;
-        // BRANCH: the chain ran out: no node may wait idle
-        if self.head.is_null() {
-            self.flush_returns();
+        self.returns.count += 1;
+        // BRANCH: a full batch, or the chain ran out; send `first ..= node` home
+        if self.returns.count >= self.return_batch || next.is_null() {
+            self.flush_returns(node);
+            self.returns.first = next;
         }
         Some(value)
     }
 
-    /// Adds an empty node to the return batch; sends the batch home first if the node goes elsewhere or it is full.
-    ///
-    /// The batch reuses the chain's own links: nodes are consumed in chain order, so the batch's last node already
-    /// points at the next one and nothing is written. Only where one chain ends and the next begins is a link stored.
-    /// The receiver thus does not write to the nodes it reads, which matters when it trails right behind a producer:
-    /// the newest nodes share cache lines with the node the producer is filling.
-    ///
-    /// # Safety
-    /// `node` must be valid, owned by the receiver and empty, and `pop` must already have read its `next`.
-    #[inline(always)]
-    unsafe fn recycle(&mut self, node: *mut GkJobNode<T, M>) {
-        // Safety: forwarded from this function's contract.
-        let channel = unsafe { (*node).channel() };
-        // BRANCH: same producer is the common case (a chain is one producer's jobs)
-        if channel == self.returns.channel {
-            // Safety: the batch's last node is ours; its `next` was read by `pop` and is not changed by anyone else.
-            unsafe {
-                let last = &(*self.returns.last).next;
-                // BRANCH: a new chain of the same producer; link it on (inside a chain the link is already there)
-                if last.load(Ordering::Relaxed) != node {
-                    last.store(node, Ordering::Relaxed);
-                }
-            }
-        } else {
-            self.flush_returns();
-            self.returns.channel = channel;
-            self.returns.first = node;
-        }
-        self.returns.last = node;
-        self.returns.count += 1;
-        // BRANCH: a full batch goes home at once
-        if self.returns.count >= self.return_batch {
-            self.flush_returns();
-        }
-    }
-
-    /// Sends the return batch home with one compare-and-swap.
+    /// Sends the return batch, `first ..= last`, home with one compare-and-swap. `last` is the node popped last; its
+    /// `next` (already read) is repointed at the inbox.
     #[inline]
-    fn flush_returns(&mut self) {
-        // BRANCH: nothing to send
-        if self.returns.count == 0 {
-            return;
-        }
+    fn flush_returns(&mut self, last: *mut GkJobNode<T, M>) {
         let batch = &self.returns;
         // Safety: the batch is a valid chain of empty nodes of `batch.channel`, owned by this receiver.
-        unsafe { return_chain(batch.channel, batch.first, batch.last, batch.count) };
-        self.returns = GkReturnBatch::EMPTY;
+        unsafe { return_chain(batch.channel, batch.first, last, batch.count) };
+        self.returns.count = 0;
     }
 
     /// Makes the next sender's jobs the current chain, one sender per call, in laps over the senders. Called only when
@@ -1680,6 +1630,12 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                     taken
                 } else {
                     GkJobNode::reverse_in_place(taken).0
+                };
+                // The return batch starts at the chain's head (nothing is pending from the previous chain).
+                self.returns = GkReturnBatch {
+                    channel,
+                    first: self.head,
+                    count: 0,
                 };
                 return true;
             }
