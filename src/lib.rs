@@ -11,6 +11,11 @@
 //! - [`fast_hashmap`]: [`FastU64Map`], a `HashMap` keyed by `u64` that skips hashing.
 //! - [`refcounted`]: [`GkRefCounted`], an `Arc`-like pointer with an intrusive reference count.
 //! - [`treiber_stack`]: lock-free Treiber stack helpers and a bounded [`TreiberQueue`].
+//! - [`treiber_channel::channel_waker`]: [`GkWaker`], how a channel's receiver sleeps and is woken (std threads by default, async
+//!   tasks through [`GkTaskWaker`], or your own thread pool or runtime).
+//! - [`treiber_channel::channel_memory`]: [`GkChannelMemory`], where a channel allocates (the heap by default, or a region you map
+//!   yourself through [`GkRegionMemory`]).
+//! - [`treiber_channel`]: [`GkTreiberChannel`], a many-producer single-consumer channel made of per-thread Treiber stacks.
 //!
 //! The crate's dependencies, [`crossbeam_utils`] and [`nohash_hasher`], are
 //! re-exported at the root, so you can use them without depending on them yourself.
@@ -22,10 +27,17 @@ pub use nohash_hasher;
 
 pub mod fast_hashmap;
 pub mod refcounted;
+pub mod treiber_channel;
 pub mod treiber_stack;
 
+pub use treiber_channel::channel_memory::{GkChannelMemory, GkHeapMemory, GkRegionError, GkRegionMemory};
+pub use treiber_channel::channel_waker::{GkAsyncWaker, GkTaskWaker, GkThreadWaker, GkWaker};
 pub use fast_hashmap::{FastU64Map, SqliteFastU64Map};
 pub use refcounted::{GkIntrinsicRefCounted, GkRefCounted};
+pub use treiber_channel::{
+    GK_GROW_NODES, GK_RETURN_BATCH, GK_SLAB_NODES, GK_SPIN_POLLS, GkReceiver, GkRecvFuture,
+    GkSender, GkTreiberChannel, GkTreiberChannelConfig, GkTreiberChannelError, GkTrySendError,
+};
 pub use treiber_stack::{
     GkTreiberPtr, GkTreiberStackIterator, TreiberNode, TreiberQueue, TreiberStackIterator,
 };

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.12.0
+
+- Added `GkTreiberChannel`, a many-producer single-consumer channel built from per-thread Treiber stacks
+  (`GkSender`, `GkReceiver`), with an optional bounded mode. `recv` returns the value itself: the receiver owns and
+  drops it, and sends the emptied nodes home in batches (one compare-and-swap per batch). The receiver spins with
+  `Backoff::spin`, then parks its thread; producers wake it with `Thread::unpark`. The receiver parks with one thread
+  handle allocated when it is taken, and tracks producers in an intrusive list, so it never allocates afterwards.
+- `GkTreiberChannelConfig` and `GkTreiberChannel::with_config` set the slab size, growth chunk size, spin polls,
+  return batch and bound; the defaults are `GK_SLAB_NODES`, `GK_GROW_NODES`, `GK_SPIN_POLLS` and `GK_RETURN_BATCH`.
+  An unbounded sender grows by whole chunks (one allocation each) and keeps them until dropped or
+  `GkSender::shrink()`, so bursts cause no allocate / free churn. An
+  invalid configuration fails with `GkTreiberChannelError::INVALID_CONFIG` before anything is allocated.
+- Waker hook: `GkWaker` (`prepare` / `park` / `unpark`), with `GkThreadWaker` (std park / unpark, the default) and
+  `GkTaskWaker` for async receive (`GkReceiver::poll_recv`, `GkReceiver::recv_async`) on any executor.
+  `GkTreiberChannel::receiver_with_waker` supplies a custom waker.
+- Memory hook: `GkChannelMemory` (`allocate` / `deallocate`), with `GkHeapMemory` (the default) and `GkRegionMemory`,
+  an allocator over a region the caller maps. `GkTreiberChannel::with_memory` allocates everything through it; a full
+  memory gives `GkTreiberChannelError::OUT_OF_MEMORY` when creating and `Full` on an unbounded send.
+- `GkTreiberChannelConfig::single_producer` makes a 1:1 channel (a second `sender()` fails with `SENDER_TAKEN`).
+- New dev-dependency `tokio` for the async receive tests.
+- A send publishes with a `SeqCst` compare-and-swap and checks the waiter with a `SeqCst` load, with no separate fence.
+- New dev-dependency `crossbeam-channel` for the comparison measurements in `tests/`.
+
 ## 0.11.4
 
 - `reap_all` takes the head with an `Acquire` swap instead of `AcqRel`. The

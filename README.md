@@ -379,6 +379,88 @@ assert_eq!(newest_first, [3, 2, 1]);
 assert!(stack.is_empty());
 ```
 
+## GkTreiberChannel
+
+A many-producer, one-consumer channel built from one Treiber stack set per producing thread. Each producer owns a
+`GkSender` with its own pre-allocated pool of job nodes, so a warm sender never allocates and producers never touch each
+other's cache lines. The receiver takes every producer's outbox with one swap each and hands the jobs out in order
+(FIFO per producer, unspecified between producers). `recv` moves the value out to the receiver, which owns and drops it;
+the emptied node goes back to its sender at once, in batches, ready for the next job.
+
+```rust
+use adaptif_gatotkaca_utils::GkTreiberChannel;
+use std::thread;
+
+let channel = GkTreiberChannel::<u64>::new();
+let mut receiver = channel.receiver().unwrap();
+
+let producers: Vec<_> = (0..4u64)
+    .map(|id| {
+        let mut sender = channel.sender().unwrap(); // one per producing thread
+        thread::spawn(move || {
+            for i in 0..100 {
+                sender.send(id * 1000 + i).unwrap();
+            }
+        })
+    })
+    .collect();
+
+let mut received = 0;
+while let Ok(value) = receiver.recv() {
+    let _value: u64 = value; // the receiver owns the value; its node is already on its way home
+    received += 1;
+}
+for producer in producers {
+    producer.join().unwrap();
+}
+assert_eq!(received, 400);
+```
+
+`GkTreiberChannel::new_bounded()` caps each sender at `GK_SLAB_NODES` (4096) jobs not yet received: `send` then waits for
+the receiver, and `try_send` returns `GkTrySendError::Full`. An unbounded sender that runs out of nodes grows by a whole
+chunk of `GK_GROW_NODES` (4096) nodes in one allocation and keeps it until it is dropped; `GkSender::shrink()` frees the
+chunks whose nodes are all back home. `GkTreiberChannel::with_config(GkTreiberChannelConfig)` sets the slab size, chunk
+size, receiver spin, return batch, bound and `single_producer` (a 1:1 channel); every field defaults to its `GK_*`
+constant. The receiver spins briefly, then sleeps; the first producer to find it asleep wakes it. Memory: about 97 KiB
+per sender while idle.
+
+Need more throughput? Raise `slab_nodes` (`GkTreiberChannelConfig::DEFAULT.with_slab_nodes(65_536)`): each sender then
+has more jobs in flight before it waits or grows, at the cost of memory per sender.
+
+Two hooks, both type parameters with defaults (`GkTreiberChannel<T, W = GkThreadWaker, M = GkHeapMemory>`):
+
+- `GkWaker` (`prepare`, `park`, `unpark`): how the receiver sleeps and is woken. The default uses `std::thread::park`;
+  a thread pool or runtime supplies its own through `receiver_with_waker`. With `GkTaskWaker`, `recv_async().await`
+  and `poll_recv` receive from async code on tokio or any other executor.
+- `GkChannelMemory` (`allocate`, `deallocate`): where the channel allocates. `GkTreiberChannel::with_memory(config,
+  memory)` with `GkRegionMemory::new(base, len)` puts many channels in a region you map yourself.
+
+### Benchmark
+
+Throughput in millions of `u64` messages per second, with the default configuration (4096-node slab, 4096-node growth
+chunks), 500,000 messages per producer, one receiver draining until every sender is gone, median of 5 runs. Measured on
+an Apple M3 (4 performance + 4 efficiency cores), so from 4 producers up some threads run on efficiency cores.
+
+| Producers | treiber | treiber 1:1 | treiber bounded | crossbeam unbounded | crossbeam bounded(4096) | std mpsc |
+|---|---|---|---|---|---|---|
+| 1 | 251 | 251 | 157 | 99 | 105 | 108 |
+| 2 | 231 | – | 178 | 115 | 128 | 43 |
+| 3 | 220 | – | 195 | 127 | 81 | 47 |
+| 4 | 218 | – | 181 | 127 | 49 | 13 |
+| 5 | 220 | – | 181 | 121 | 35 | 17 |
+| 6 | 216 | – | 179 | 110 | 64 | 14 |
+
+- `treiber`: `GkTreiberChannel::new()` (unbounded). `treiber 1:1`: `single_producer`, measured with one producer only.
+  `treiber bounded`: `new_bounded()`, 4096 jobs per sender; crossbeam's bound of 4096 is for the whole channel.
+- The 1-producer row varies most between runs (the unbounded treiber measured 107 to 251 in back-to-back runs).
+- Ping-pong round trip (send one value, wait for the echo), in microseconds: treiber p50 0.3 / p99 0.4, crossbeam
+  unbounded 0.2 / 0.8, crossbeam bounded 0.2 / 0.2, std mpsc 1.9 / 4.5.
+- A bigger slab is faster: with `slab_nodes(65_536)`, bounded treiber measured 232 to 274 across 1 to 6 producers.
+
+The tests in `tests/treiber_channel*.rs` cover ordering, wakeups, bounds, drops and leaks. The measurements
+`tests/bench_treiber_channel.rs` and `tests/bench_treiber_channel_memory.rs` compare it with `crossbeam_channel` and
+`std::sync::mpsc`; run them with `cargo test --release --test bench_treiber_channel -- --ignored --nocapture`.
+
 ## Safety
 
 `GkRefCounted` and the Treiber stack work with raw pointers, and the compiler
