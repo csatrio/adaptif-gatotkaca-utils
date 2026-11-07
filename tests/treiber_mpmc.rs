@@ -1,5 +1,5 @@
-//! GkTreiberMpmc: chains in push order, ranking, lane limits and reuse, drains, unrun jobs freed, and stress runs with
-//! short-lived workers and a pool-style parking handshake.
+//! GkTreiberMpmc: chains in push order, shared chains taken over from a blocked worker, ranking, lane limits and
+//! reuse, drains, unrun jobs freed, and stress runs with short-lived workers and a pool-style parking handshake.
 
 // ==== Import Definition ====
 
@@ -48,9 +48,13 @@ fn job(lane: usize, seq: u64) -> NonNull<Job> {
     .unwrap()
 }
 
-fn take(job: *mut Job) -> Box<Job> {
+fn take(job: NonNull<Job>) -> Box<Job> {
     // Safety: every job in these tests comes from `job` and is taken once.
-    unsafe { Box::from_raw(job) }
+    unsafe { Box::from_raw(job.as_ptr()) }
+}
+
+fn seq(job: NonNull<Job>) -> u64 {
+    take(job).seq
 }
 
 fn within<R: Send + 'static>(mut seconds: u64, f: impl FnOnce() -> R + Send + 'static) -> R {
@@ -66,7 +70,7 @@ fn within<R: Send + 'static>(mut seconds: u64, f: impl FnOnce() -> R + Send + 's
         .expect("test timed out")
 }
 
-/// One reap: the (lane, seq) of each job, in chain order.
+/// One `try_reap`, run to the end: the (lane, seq) of each job, in order.
 fn reap_one<M: GkChannelMemory>(queue: &GkTreiberMpmc<Job, M>) -> Option<Vec<(usize, u64)>> {
     let chain = queue.try_reap()?;
     Some(
@@ -79,13 +83,20 @@ fn reap_one<M: GkChannelMemory>(queue: &GkTreiberMpmc<Job, M>) -> Option<Vec<(us
     )
 }
 
-/// Reaps until `None`, returning the sequence numbers in reap order.
+/// `try_reap` until `None`, returning the sequence numbers in the order they came.
 fn reap_all<M: GkChannelMemory>(queue: &GkTreiberMpmc<Job, M>) -> Vec<u64> {
     let mut seqs = Vec::new();
     while let Some(chain) = reap_one(queue) {
         seqs.extend(chain.into_iter().map(|(_, seq)| seq));
     }
     seqs
+}
+
+fn push_range(lane: &mut adaptif_gatotkaca_utils::GkMpmcLane<Job>, seqs: std::ops::Range<u64>) {
+    let index = lane.index();
+    for seq in seqs {
+        unsafe { lane.push(job(index, seq)) };
+    }
 }
 
 // ==== Single thread ====
@@ -96,17 +107,21 @@ fn one_reap_takes_the_whole_lane_in_push_order() {
     assert!(queue.try_reap().is_none());
     assert!(!queue.has_work());
     let mut lane = queue.lane().unwrap();
-    for seq in 0..1000 {
-        unsafe { lane.push(job(0, seq)) };
-    }
+    push_range(&mut lane, 0..1000);
     assert!(queue.has_work());
-    let chain = reap_one(&queue).unwrap();
+    let chain = queue.try_reap().unwrap();
+    assert!(chain.published());
     assert_eq!(
-        chain.iter().map(|&(_, seq)| seq).collect::<Vec<_>>(),
+        chain.map(seq).collect::<Vec<_>>(),
         (0..1000).collect::<Vec<_>>()
     );
     assert!(queue.try_reap().is_none());
     assert!(!queue.has_work());
+    // A single job has nothing to share.
+    push_range(&mut lane, 1000..1001);
+    let chain = queue.try_reap().unwrap();
+    assert!(!chain.published());
+    assert_eq!(chain.map(seq).collect::<Vec<_>>(), [1000]);
 }
 
 #[test]
@@ -116,15 +131,94 @@ fn chains_between_pushes_stay_in_order() {
     let mut seen = Vec::new();
     let mut next = 0;
     for burst in [10, 1, 7, 3, 20, 4] {
-        for _ in 0..burst {
-            unsafe { lane.push(job(0, next)) };
-            next += 1;
-        }
+        push_range(&mut lane, next..next + burst);
+        next += burst;
         let chain = reap_one(&queue).unwrap();
-        assert_eq!(chain.len(), burst);
+        assert_eq!(chain.len() as u64, burst);
         seen.extend(chain.into_iter().map(|(_, seq)| seq));
     }
     assert_eq!(seen, (0..next).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_blocked_chain_is_taken_over() {
+    let delay = Duration::from_millis(2);
+    let queue =
+        GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_rescue_after(delay))
+            .unwrap();
+    let mut lane = queue.lane().unwrap();
+    push_range(&mut lane, 0..100);
+    // Worker A reaps and "blocks" in its first job.
+    let mut a = queue.try_reap().unwrap();
+    assert_eq!(seq(a.next().unwrap()), 0);
+    assert!(a.published());
+    // The lanes are empty; the rest is shared.
+    assert!(!queue.has_work());
+    assert_eq!(queue.shared_chains(), 1);
+    // Worker B finds the chain stalled once `delay` has passed, and takes it over.
+    let started = std::time::Instant::now();
+    let mut b = loop {
+        if let Some(chain) = queue.try_reap() {
+            break chain;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "never rescued");
+        thread::sleep(delay / 4);
+    };
+    assert!(!b.published());
+    assert_eq!(seq(b.next().unwrap()), 1);
+    // B took the chain over: A, back from its block, gets nothing more, and B carries on alone.
+    assert!(a.next().is_none());
+    assert_eq!(b.map(seq).collect::<Vec<_>>(), (2..100).collect::<Vec<_>>());
+    assert_eq!(queue.shared_chains(), 0);
+}
+
+#[test]
+fn a_busy_chain_is_not_taken_over() {
+    let queue = GkTreiberMpmc::<Job>::with_config(
+        GkTreiberMpmcConfig::DEFAULT.with_rescue_after(Duration::from_secs(60)),
+    )
+    .unwrap();
+    let mut lane = queue.lane().unwrap();
+    push_range(&mut lane, 0..10);
+    let mut a = queue.try_reap().unwrap();
+    assert_eq!(seq(a.next().unwrap()), 0);
+    // Idle workers look, but the chain has not stalled for `rescue_after`: it stays with its owner.
+    for _ in 0..3 {
+        assert!(queue.try_reap().is_none());
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(a.map(seq).collect::<Vec<_>>(), (1..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn zero_chain_slots_keep_the_chain_private() {
+    let queue =
+        GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_chains(0)).unwrap();
+    let mut lane = queue.lane().unwrap();
+    push_range(&mut lane, 0..100);
+    let mut a = queue.try_reap().unwrap();
+    assert_eq!(seq(a.next().unwrap()), 0);
+    assert!(!a.published());
+    // Nobody else can see the rest.
+    assert!(queue.try_reap().is_none());
+    assert!(!queue.has_work());
+    assert_eq!(a.map(seq).collect::<Vec<_>>(), (1..100).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_dropped_chain_gives_its_jobs_back() {
+    // No rescue delay: the dropped chain has no owner, and this test takes it over at once.
+    let queue = GkTreiberMpmc::<Job>::with_config(
+        GkTreiberMpmcConfig::DEFAULT.with_rescue_after(Duration::ZERO),
+    )
+    .unwrap();
+    let mut lane = queue.lane().unwrap();
+    push_range(&mut lane, 0..10);
+    // Dropped before taking anything: the first job is shared again, the rest already is.
+    drop(queue.try_reap().unwrap());
+    let mut seen = reap_all(&queue);
+    seen.sort_unstable();
+    assert_eq!(seen, (0..10).collect::<Vec<_>>());
 }
 
 #[test]
@@ -132,19 +226,13 @@ fn ranks_the_largest_backlog_first() {
     let queue = GkTreiberMpmc::<Job>::new();
     let mut a = queue.lane().unwrap();
     let mut b = queue.lane().unwrap();
-    for seq in 0..3 {
-        unsafe { a.push(job(a.index(), seq)) };
-    }
-    for seq in 0..50 {
-        unsafe { b.push(job(b.index(), seq)) };
-    }
+    push_range(&mut a, 0..3);
+    push_range(&mut b, 0..50);
     let first = reap_one(&queue).unwrap();
     assert_eq!(first.len(), 50);
     assert!(first.iter().all(|&(lane, _)| lane == b.index()));
     // The reap counted as taken: `b` now has a smaller backlog than `a`.
-    for seq in 50..52 {
-        unsafe { b.push(job(b.index(), seq)) };
-    }
+    push_range(&mut b, 50..52);
     let second = reap_one(&queue).unwrap();
     assert_eq!(second, [(a.index(), 0), (a.index(), 1), (a.index(), 2)]);
     assert_eq!(reap_one(&queue).unwrap().len(), 2);
@@ -162,16 +250,12 @@ fn lane_limit_and_reuse() {
         GkTreiberChannelError::TOO_MANY_LANES
     );
     assert_eq!((first.index(), second.index()), (0, 1));
-    for seq in 0..6 {
-        unsafe { first.push(job(0, seq)) };
-    }
+    push_range(&mut first, 0..6);
     // Released with jobs still queued: they stay, and the next owner's jobs come after them.
     drop(first);
     let mut reused = queue.lane().unwrap();
     assert_eq!(reused.index(), 0);
-    for seq in 6..12 {
-        unsafe { reused.push(job(0, seq)) };
-    }
+    push_range(&mut reused, 6..12);
     assert_eq!(reap_all(&queue), (0..12).collect::<Vec<_>>());
     drop(second);
 }
@@ -180,22 +264,20 @@ fn lane_limit_and_reuse() {
 fn lane_drain_takes_what_workers_have_not_reaped() {
     let queue = GkTreiberMpmc::<Job>::new();
     let mut lane = queue.lane().unwrap();
-    for seq in 0..10 {
-        unsafe { lane.push(job(0, seq)) };
-    }
-    // A worker holds this chain; the drain does not see it.
-    let held = queue.try_reap().unwrap();
-    for seq in 10..110 {
-        unsafe { lane.push(job(0, seq)) };
-    }
+    push_range(&mut lane, 0..10);
+    // A worker reaped these: job 0 is its own, 1..10 wait in a chain slot.
+    let mut held = queue.try_reap().unwrap();
+    assert_eq!(seq(held.next().unwrap()), 0);
+    push_range(&mut lane, 10..110);
     let mut drained = Vec::new();
-    assert_eq!(lane.drain(|job| drained.push(take(job.as_ptr()).seq)), 100);
+    assert_eq!(lane.drain(|job| drained.push(seq(job))), 100);
     assert_eq!(drained, (10..110).collect::<Vec<_>>());
+    // The queue's drain also takes the shared chain.
+    let mut rest = Vec::new();
+    assert_eq!(queue.drain(|job| rest.push(seq(job))), 9);
+    assert_eq!(rest, (1..10).collect::<Vec<_>>());
+    assert!(held.next().is_none());
     assert!(!queue.has_work());
-    assert_eq!(
-        held.map(|job| take(job).seq).collect::<Vec<_>>(),
-        (0..10).collect::<Vec<_>>()
-    );
 }
 
 #[test]
@@ -203,15 +285,10 @@ fn queue_drain_takes_every_lane() {
     let queue = GkTreiberMpmc::<Job>::new();
     let mut lanes: Vec<_> = (0..3).map(|_| queue.lane().unwrap()).collect();
     for (index, lane) in lanes.iter_mut().enumerate() {
-        for seq in 0..(10 * (index as u64 + 1)) {
-            unsafe { lane.push(job(index, seq)) };
-        }
+        push_range(lane, 0..(10 * (index as u64 + 1)));
     }
     let mut per_lane = [0u64; 3];
-    assert_eq!(
-        queue.drain(|job| per_lane[take(job.as_ptr()).lane] += 1),
-        60
-    );
+    assert_eq!(queue.drain(|job| per_lane[take(job).lane] += 1), 60);
     assert_eq!(per_lane, [10, 20, 30]);
     assert!(!queue.has_work());
 }
@@ -221,6 +298,7 @@ fn invalid_config() {
     for config in [
         GkTreiberMpmcConfig::DEFAULT.with_max_lanes(0),
         GkTreiberMpmcConfig::DEFAULT.with_max_lanes(usize::MAX),
+        GkTreiberMpmcConfig::DEFAULT.with_max_chains(usize::MAX),
     ] {
         assert_eq!(
             GkTreiberMpmc::<Job>::with_config(config).unwrap_err(),
@@ -264,27 +342,43 @@ fn unrun_jobs_are_freed() {
         })))
         .unwrap()
     };
+    let run = |job: NonNull<Counted>| drop(unsafe { Box::from_raw(job.as_ptr()) });
+    // Without chain slots, a chain dropped half-run puts the rest back on its lane; the last handle frees it.
+    let private =
+        GkTreiberMpmc::<Counted>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_chains(0))
+            .unwrap();
+    let mut lane = private.lane().unwrap();
+    for _ in 0..50 {
+        unsafe { lane.push(counted()) };
+    }
+    let mut chain = private.try_reap().unwrap();
+    for _ in 0..2 {
+        run(chain.next().unwrap());
+    }
+    drop(chain);
+    assert_eq!(DROPPED.load(Ordering::Relaxed), 2);
+    assert!(private.has_work());
+    drop((lane, private));
+    assert_eq!(DROPPED.load(Ordering::Relaxed), 50);
+    // With chain slots, the rest stays shared; the last handle frees it, and what is still in the lanes.
     let queue = GkTreiberMpmc::<Counted>::new();
     let worker = queue.clone();
     let mut lane = queue.lane().unwrap();
     for _ in 0..50 {
         unsafe { lane.push(counted()) };
     }
-    // A worker runs two jobs of its chain and drops the rest.
     let mut chain = queue.try_reap().unwrap();
     for _ in 0..2 {
-        drop(unsafe { Box::from_raw(chain.next().unwrap()) });
+        run(chain.next().unwrap());
     }
     drop(chain);
-    assert_eq!(DROPPED.load(Ordering::Relaxed), 50);
     for _ in 0..10 {
         unsafe { lane.push(counted()) };
     }
-    // Jobs still queued are freed by the last handle.
     drop((lane, queue));
-    assert_eq!(DROPPED.load(Ordering::Relaxed), 50);
+    assert_eq!(DROPPED.load(Ordering::Relaxed), 52);
     drop(worker);
-    assert_eq!(DROPPED.load(Ordering::Relaxed), 60);
+    assert_eq!(DROPPED.load(Ordering::Relaxed), 110);
 }
 
 #[test]
@@ -294,14 +388,17 @@ fn region_memory_is_given_back() {
     // Safety: the buffer outlives the queue and nothing else uses it.
     let region = unsafe { GkRegionMemory::new(base, buffer.len() * 8) }.unwrap();
     let queue = GkTreiberMpmc::<Job, _>::with_memory(
-        GkTreiberMpmcConfig::DEFAULT.with_max_lanes(4),
+        GkTreiberMpmcConfig::DEFAULT
+            .with_max_lanes(4)
+            .with_max_chains(8),
         region,
     )
     .unwrap();
     assert!(region.in_use() > 0);
     let mut lane = queue.lane().unwrap();
+    let index = lane.index();
     for seq in 0..40 {
-        unsafe { lane.push(job(0, seq)) };
+        unsafe { lane.push(job(index, seq)) };
     }
     assert_eq!(reap_all(&queue), (0..40).collect::<Vec<_>>());
     drop((lane, queue));
@@ -310,9 +407,54 @@ fn region_memory_is_given_back() {
 
 // ==== Threads ====
 
+/// A worker blocks in the first job of a long chain until every other job has run. Other workers must take the rest
+/// from its chain slot; if the chain were held, this would never finish.
+#[test]
+fn other_workers_finish_a_blocked_chain() {
+    const JOBS: u64 = if cfg!(miri) { 200 } else { 20_000 };
+    within(60, || {
+        let queue = GkTreiberMpmc::<Job>::new();
+        let mut lane = queue.lane().unwrap();
+        push_range(&mut lane, 0..JOBS);
+        let mut blocked = queue.try_reap().unwrap();
+        assert!(blocked.published());
+        let first = blocked.next().unwrap();
+        let done = Arc::new(AtomicU64::new(0));
+        let helpers: Vec<_> = (0..3)
+            .map(|_| {
+                let (queue, done) = (queue.clone(), done.clone());
+                thread::spawn(move || {
+                    while done.load(Ordering::Relaxed) < JOBS - 1 {
+                        let Some(chain) = queue.try_reap() else {
+                            thread::yield_now();
+                            continue;
+                        };
+                        let mut last = None;
+                        for job in chain {
+                            let seq = seq(job);
+                            assert!(last.is_none_or(|last| last < seq));
+                            last = Some(seq);
+                            done.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        // The "blocked" job waits for everything else.
+        while done.load(Ordering::Relaxed) < JOBS - 1 {
+            thread::yield_now();
+        }
+        assert_eq!(seq(first), 0);
+        assert!(blocked.next().is_none());
+        for handle in helpers {
+            handle.join().unwrap();
+        }
+        assert!(!queue.has_work());
+    });
+}
+
 /// Producers push into their lanes while workers come and go (each runs a few chains and exits). Every job is taken
-/// exactly once, each chain is a run of consecutive jobs of one lane, and each worker sees each lane's jobs in push
-/// order.
+/// exactly once, and each chain yields one lane's jobs in push order.
 #[test]
 fn exactly_once_with_short_lived_workers() {
     const PRODUCERS: usize = 4;
@@ -344,31 +486,22 @@ fn exactly_once_with_short_lived_workers() {
         let spawn_worker = |chains: u64| {
             let (queue, seen, taken) = (queue.clone(), seen.clone(), taken.clone());
             thread::spawn(move || {
-                let mut last = [None::<u64>; PRODUCERS];
                 let mut done = 0;
                 while done < chains && taken.load(Ordering::Relaxed) < total {
                     let Some(chain) = queue.try_reap() else {
                         thread::yield_now();
                         continue;
                     };
-                    let mut chain_lane = None;
-                    let mut count = 0;
+                    // One reap per chain: one lane, oldest first (other workers may take some in between).
+                    let mut last = None::<(usize, u64)>;
                     for job in chain {
                         let job = take(job);
-                        // One lane per chain, consecutive jobs.
-                        assert_eq!(*chain_lane.get_or_insert(job.lane), job.lane);
-                        if let Some(last) = last[job.lane] {
-                            assert!(last < job.seq);
-                            if count > 0 {
-                                assert_eq!(last + 1, job.seq);
-                            }
-                        }
-                        last[job.lane] = Some(job.seq);
+                        assert!(last.is_none_or(|(lane, seq)| lane == job.lane && seq < job.seq));
+                        last = Some((job.lane, job.seq));
                         let slot = job.lane as u64 * PER + job.seq;
                         assert!(!seen[slot as usize].swap(true, Ordering::Relaxed));
-                        count += 1;
+                        taken.fetch_add(1, Ordering::Relaxed);
                     }
-                    taken.fetch_add(count, Ordering::Relaxed);
                     done += 1;
                 }
             })
@@ -397,7 +530,8 @@ fn exactly_once_with_short_lived_workers() {
 
 /// A pool-style handshake: a worker announces itself asleep with a `SeqCst` RMW on the state word, re-checks
 /// `has_work` and only then waits; a producer pushes, then does a `SeqCst` RMW on the same word and wakes a worker if
-/// any is asleep. Small bursts keep the workers parking all the time. A lost wake-up hangs, and the test times out.
+/// any is asleep. While chains are shared, a worker parks with a timeout, to rescue one that stalls. Small bursts keep the workers parking all
+/// the time. A lost wake-up hangs, and the test times out.
 #[test]
 fn no_lost_wakeups_with_pool_handshake() {
     const PRODUCERS: usize = 3;
@@ -411,6 +545,15 @@ fn no_lost_wakeups_with_pool_handshake() {
             wake: Condvar,
             done: AtomicBool,
             taken: AtomicU64,
+        }
+        impl Pool {
+            fn notify(&self) {
+                // BRANCH: someone is (about to be) asleep
+                if self.sleepers.fetch_add(0, Ordering::SeqCst) > 0 {
+                    let _guard = self.lock.lock().unwrap();
+                    self.wake.notify_one();
+                }
+            }
         }
         let pool = Arc::new(Pool {
             queue: GkTreiberMpmc::new(),
@@ -426,6 +569,9 @@ fn no_lost_wakeups_with_pool_handshake() {
                 thread::spawn(move || {
                     loop {
                         if let Some(chain) = pool.queue.try_reap() {
+                            if chain.published() {
+                                pool.notify();
+                            }
                             let count = chain.map(|job| drop(take(job))).count();
                             pool.taken.fetch_add(count as u64, Ordering::Relaxed);
                             continue;
@@ -437,11 +583,23 @@ fn no_lost_wakeups_with_pool_handshake() {
                             pool.sleepers.fetch_sub(1, Ordering::SeqCst);
                             continue;
                         }
-                        if pool.done.load(Ordering::SeqCst) {
+                        let shared = pool.queue.shared_chains() > 0;
+                        if pool.done.load(Ordering::SeqCst) && !shared {
                             pool.sleepers.fetch_sub(1, Ordering::SeqCst);
                             return;
                         }
-                        let guard = pool.wake.wait(guard).unwrap();
+                        // BRANCH: a shared chain may stall with nobody to signal it; wake in time to rescue it
+                        let guard = if shared {
+                            pool.wake
+                                .wait_timeout(
+                                    guard,
+                                    2 * adaptif_gatotkaca_utils::GK_MPMC_RESCUE_AFTER,
+                                )
+                                .unwrap()
+                                .0
+                        } else {
+                            pool.wake.wait(guard).unwrap()
+                        };
                         pool.sleepers.fetch_sub(1, Ordering::SeqCst);
                         drop(guard);
                     }
@@ -456,11 +614,7 @@ fn no_lost_wakeups_with_pool_handshake() {
                     let index = lane.index();
                     for seq in 0..PER {
                         unsafe { lane.push(job(index, seq)) };
-                        // BRANCH: someone is (about to be) asleep
-                        if pool.sleepers.fetch_add(0, Ordering::SeqCst) > 0 {
-                            let _guard = pool.lock.lock().unwrap();
-                            pool.wake.notify_one();
-                        }
+                        pool.notify();
                         if seq % 64 == 0 {
                             thread::sleep(Duration::from_micros(20));
                         }
@@ -487,8 +641,8 @@ fn no_lost_wakeups_with_pool_handshake() {
     });
 }
 
-/// A producer drains its own lane while it pushes and workers reap it: every job is taken once, by one side or the
-/// other.
+/// A producer drains its own lane while it pushes and workers reap it; the queue's drain takes what the workers left
+/// in chain slots. Every job is taken once.
 #[test]
 fn producer_drain_races_workers() {
     const PER: u64 = if cfg!(miri) { 300 } else { 50_000 };
@@ -503,8 +657,9 @@ fn producer_drain_races_workers() {
                     thread::spawn(move || {
                         let mut seqs = Vec::new();
                         while !stop.load(Ordering::Relaxed) {
-                            if let Some(chain) = queue.try_reap() {
-                                seqs.extend(chain.map(|job| take(job).seq));
+                            if let Some(mut chain) = queue.try_reap() {
+                                // Run part of the chain, as a worker that exits midway would.
+                                seqs.extend(chain.by_ref().take(7).map(seq));
                             }
                         }
                         seqs
@@ -515,18 +670,18 @@ fn producer_drain_races_workers() {
             for seq in 0..PER {
                 unsafe { lane.push(job(0, seq)) };
                 if seq % 100 == 99 {
-                    lane.drain(|job| drained.push(take(job.as_ptr()).seq));
+                    lane.drain(|job| drained.push(self::seq(job)));
                 }
             }
-            lane.drain(|job| drained.push(take(job.as_ptr()).seq));
+            lane.drain(|job| drained.push(seq(job)));
             stop.store(true, Ordering::Relaxed);
-            assert!(drained.is_sorted());
+            // Not checked for order: a worker that drops its chain while every slot is taken puts the older jobs back
+            // on top of the lane, so a drain can return them after newer ones.
             let mut all = drained;
             for handle in workers {
-                let seqs = handle.join().unwrap();
-                assert!(seqs.is_sorted());
-                all.extend(seqs);
+                all.extend(handle.join().unwrap());
             }
+            queue.drain(|job| all.push(seq(job)));
             all.sort_unstable();
             assert_eq!(all, (0..PER).collect::<Vec<_>>());
         }

@@ -1,22 +1,29 @@
 //! GkTreiberMpmc against crossbeam's MPMC channel and crossbeam-deque (measurement, `--ignored`):
 //! `cargo test --release --test bench_treiber_mpmc -- --ignored --nocapture`
 //!
-//! P producer threads each queue `PER_PRODUCER` boxed jobs (allocated before the clock starts); C worker threads take
-//! them and free them. Contenders:
+//! P producer threads each queue boxed jobs (allocated before the clock starts); C worker threads take them, run them
+//! and free them. Contenders:
 //!
-//! - `treiber`: `GkTreiberMpmc`, workers spin on `try_reap` and run each reaped lane chain themselves (the pool
-//!   decides parking, not the queue).
+//! - `treiber`: `GkTreiberMpmc`, workers spin on `try_reap` and run each chain (the pool decides parking, not the
+//!   queue). The rest of each reap is shared in a chain slot, so idle workers take over from a blocked one.
+//! - `reap-only`: the same with `max_chains(0)`: a worker keeps its whole reap, so a block holds the rest.
 //! - `cb channel`: `crossbeam_channel::unbounded`, workers use `recv` (spins before it parks).
 //! - `cb injector`: `crossbeam_deque::Injector`, workers spin on `steal`, one job at a time: a shared FIFO, no
 //!   per-worker state.
 //! - `cb deque`: tokio's model, the injector plus a FIFO `Worker` deque per worker, filled with `steal_batch_and_pop`
-//!   and stolen from by the others. Like `treiber`, workers take jobs in batches.
+//!   and stolen from by the others.
+//!
+//! Two runs:
+//!
+//! - throughput: empty jobs, `THROUGHPUT_JOBS` per producer, millions of jobs per second.
+//! - blocking: `BLOCKING_JOBS` per producer, every `BLOCK_EVERY`th job sleeps `BLOCK_FOR` (an `fsync` stand-in);
+//!   wall time in milliseconds. The ideal is the total sleep divided by the workers.
 //!
 //! Median of `ROUNDS` runs, each bounded by `RUN_LIMIT`.
 
 // ==== Import Definition ====
 
-use adaptif_gatotkaca_utils::{GkTreiberMpmc, TreiberNode};
+use adaptif_gatotkaca_utils::{GkTreiberMpmc, GkTreiberMpmcConfig, TreiberNode};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
 use std::{
@@ -32,36 +39,111 @@ use std::{
 
 // ==== Parameters ====
 
-const PER_PRODUCER: u64 = 500_000;
+const THROUGHPUT_JOBS: u64 = 500_000;
 const PRODUCER_COUNTS: [usize; 3] = [1, 2, 4];
 const WORKER_COUNTS: [usize; 3] = [2, 4, 8];
+const BLOCKING_JOBS: u64 = 20_000;
+const BLOCK_EVERY: u64 = 500;
+const BLOCK_FOR: Duration = Duration::from_millis(1);
+const BLOCKING_SHAPES: [(usize, usize); 3] = [(1, 4), (2, 8), (4, 8)];
 const ROUNDS: usize = 5;
 const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+/// What the producers queue.
+#[derive(Clone, Copy)]
+struct Load {
+    producers: usize,
+    workers: usize,
+    per_producer: u64,
+    /// Every this many jobs, one sleeps `BLOCK_FOR`; 0 for none.
+    block_every: u64,
+}
+
+impl Load {
+    fn total(&self) -> u64 {
+        self.per_producer * self.producers as u64
+    }
+}
+
+/// The contenders.
+#[derive(Clone, Copy)]
+enum Kind {
+    Treiber,
+    ReapOnly,
+    Channel,
+    Injector,
+    Deque,
+}
+
+const KINDS: [Kind; 5] = [
+    Kind::Treiber,
+    Kind::ReapOnly,
+    Kind::Channel,
+    Kind::Injector,
+    Kind::Deque,
+];
+
+impl Kind {
+    fn name(self) -> &'static str {
+        // BRANCH: one name per contender
+        match self {
+            Kind::Treiber => "treiber",
+            Kind::ReapOnly => "reap-only",
+            Kind::Channel => "cb channel",
+            Kind::Injector => "cb injector",
+            Kind::Deque => "cb deque",
+        }
+    }
+
+    /// Seconds for one run of `load`.
+    fn run(self, load: Load) -> f64 {
+        // BRANCH: one runner per contender
+        match self {
+            Kind::Treiber => treiber(load, GkTreiberMpmcConfig::DEFAULT),
+            Kind::ReapOnly => treiber(load, GkTreiberMpmcConfig::DEFAULT.with_max_chains(0)),
+            Kind::Channel => crossbeam(load),
+            Kind::Injector => deque(load, false),
+            Kind::Deque => deque(load, true),
+        }
+    }
+}
 
 // ==== Helpers ====
 
 struct Job {
     next: AtomicPtr<Job>,
-    id: u64,
+    block: bool,
 }
 
 impl TreiberNode for Job {
-    type Value = u64;
+    type Value = bool;
 
     fn next(&self) -> &AtomicPtr<Self> {
         &self.next
     }
 
-    fn value(&self) -> &u64 {
-        &self.id
+    fn value(&self) -> &bool {
+        &self.block
     }
 }
 
-fn boxed(id: u64) -> Box<Job> {
+fn boxed(id: u64, block_every: u64) -> Box<Job> {
     Box::new(Job {
         next: AtomicPtr::default(),
-        id,
+        block: block_every != 0 && id % block_every == 0,
     })
+}
+
+/// Runs a job: sleeps if it is a blocking one, then frees it.
+#[allow(
+    clippy::boxed_local,
+    reason = "each job is its own allocation, as in a pool"
+)]
+fn run(job: Box<Job>) {
+    // BRANCH: an `fsync` stand-in
+    if job.block {
+        thread::sleep(BLOCK_FOR);
+    }
 }
 
 /// Raw jobs that can cross threads (they are owned by whoever holds the list).
@@ -83,27 +165,42 @@ fn median(mut runs: Vec<f64>) -> f64 {
     runs[runs.len() / 2]
 }
 
+#[allow(
+    clippy::vec_box,
+    reason = "each job is its own allocation, as in a pool"
+)]
+fn batches(load: Load) -> Vec<Vec<Box<Job>>> {
+    (0..load.producers)
+        .map(|_| {
+            (0..load.per_producer)
+                .map(|id| boxed(id, load.block_every))
+                .collect()
+        })
+        .collect()
+}
+
 // ==== Runs ====
 
-/// Jobs per second through a `GkTreiberMpmc`.
-fn treiber(producers: usize, workers: usize) -> f64 {
+/// Seconds through a `GkTreiberMpmc` with `config`.
+fn treiber(load: Load, config: GkTreiberMpmcConfig) -> f64 {
     within_limit(move || {
-        let queue = GkTreiberMpmc::<Job>::new();
+        let queue = GkTreiberMpmc::<Job>::with_config(config).unwrap();
         let done = Arc::new(AtomicBool::new(false));
-        let batches: Vec<_> = (0..producers)
-            .map(|_| {
+        let jobs: Vec<_> = batches(load)
+            .into_iter()
+            .map(|jobs| {
                 Jobs(
-                    (0..PER_PRODUCER)
-                        .map(|id| NonNull::from(Box::leak(boxed(id))))
+                    jobs.into_iter()
+                        .map(|job| NonNull::from(Box::leak(job)))
                         .collect(),
                 )
             })
             .collect();
-        let lanes: Vec<_> = (0..producers).map(|_| queue.lane().unwrap()).collect();
+        let lanes: Vec<_> = (0..load.producers).map(|_| queue.lane().unwrap()).collect();
         let start = Instant::now();
         let producer_handles: Vec<_> = lanes
             .into_iter()
-            .zip(batches)
+            .zip(jobs)
             .map(|(mut lane, jobs)| {
                 thread::spawn(move || {
                     // Move the whole list in (a closure would otherwise capture only the non-`Send` field).
@@ -115,21 +212,24 @@ fn treiber(producers: usize, workers: usize) -> f64 {
                 })
             })
             .collect();
-        let worker_handles: Vec<_> = (0..workers)
+        let worker_handles: Vec<_> = (0..load.workers)
             .map(|_| {
                 let (queue, done) = (queue.clone(), done.clone());
                 thread::spawn(move || {
                     let mut taken = 0u64;
                     loop {
-                        // BRANCH: a whole lane, run here; otherwise stop once the producers are finished and
-                        // nothing is left
+                        // BRANCH: a chain, run here; otherwise stop once the producers are finished and nothing is
+                        // left
                         if let Some(chain) = queue.try_reap() {
                             for job in chain {
                                 // Safety: the job is ours now.
-                                drop(unsafe { Box::from_raw(job) });
+                                run(unsafe { Box::from_raw(job.as_ptr()) });
                                 taken += 1;
                             }
-                        } else if done.load(Ordering::Acquire) && !queue.has_work() {
+                        } else if done.load(Ordering::Acquire)
+                            && !queue.has_work()
+                            && queue.shared_chains() == 0
+                        {
                             return taken;
                         } else {
                             std::hint::spin_loop();
@@ -144,20 +244,18 @@ fn treiber(producers: usize, workers: usize) -> f64 {
         done.store(true, Ordering::Release);
         let taken: u64 = worker_handles.into_iter().map(|h| h.join().unwrap()).sum();
         let secs = start.elapsed().as_secs_f64();
-        assert_eq!(taken, PER_PRODUCER * producers as u64);
-        taken as f64 / secs
+        assert_eq!(taken, load.total());
+        secs
     })
 }
 
-/// Jobs per second through crossbeam's unbounded channel.
-fn crossbeam(producers: usize, workers: usize) -> f64 {
+/// Seconds through crossbeam's unbounded channel.
+fn crossbeam(load: Load) -> f64 {
     within_limit(move || {
         let (tx, rx) = crossbeam_channel::unbounded::<Box<Job>>();
-        let batches: Vec<Vec<Box<Job>>> = (0..producers)
-            .map(|_| (0..PER_PRODUCER).map(boxed).collect())
-            .collect();
+        let jobs = batches(load);
         let start = Instant::now();
-        let producer_handles: Vec<_> = batches
+        let producer_handles: Vec<_> = jobs
             .into_iter()
             .map(|jobs| {
                 let tx = tx.clone();
@@ -169,13 +267,13 @@ fn crossbeam(producers: usize, workers: usize) -> f64 {
             })
             .collect();
         drop(tx);
-        let worker_handles: Vec<_> = (0..workers)
+        let worker_handles: Vec<_> = (0..load.workers)
             .map(|_| {
                 let rx = rx.clone();
                 thread::spawn(move || {
                     let mut taken = 0u64;
                     while let Ok(job) = rx.recv() {
-                        drop(job);
+                        run(job);
                         taken += 1;
                     }
                     taken
@@ -187,25 +285,23 @@ fn crossbeam(producers: usize, workers: usize) -> f64 {
         }
         let taken: u64 = worker_handles.into_iter().map(|h| h.join().unwrap()).sum();
         let secs = start.elapsed().as_secs_f64();
-        assert_eq!(taken, PER_PRODUCER * producers as u64);
-        taken as f64 / secs
+        assert_eq!(taken, load.total());
+        secs
     })
 }
 
-/// Jobs per second through crossbeam-deque: the injector alone (`local_deques` false, one job per steal), or the
-/// injector plus per-worker deques filled in batches (`local_deques` true, tokio's model).
-fn deque(producers: usize, workers: usize, local_deques: bool) -> f64 {
+/// Seconds through crossbeam-deque: the injector alone (`local_deques` false, one job per steal), or the injector plus
+/// per-worker deques filled in batches (`local_deques` true, tokio's model).
+fn deque(load: Load, local_deques: bool) -> f64 {
     within_limit(move || {
         let injector = Arc::new(Injector::<Box<Job>>::new());
         let done = Arc::new(AtomicBool::new(false));
-        let batches: Vec<Vec<Box<Job>>> = (0..producers)
-            .map(|_| (0..PER_PRODUCER).map(boxed).collect())
-            .collect();
-        let locals: Vec<Worker<Box<Job>>> = (0..workers).map(|_| Worker::new_fifo()).collect();
+        let jobs = batches(load);
+        let locals: Vec<Worker<Box<Job>>> = (0..load.workers).map(|_| Worker::new_fifo()).collect();
         let stealers: Arc<Vec<Stealer<Box<Job>>>> =
             Arc::new(locals.iter().map(Worker::stealer).collect());
         let start = Instant::now();
-        let producer_handles: Vec<_> = batches
+        let producer_handles: Vec<_> = jobs
             .into_iter()
             .map(|jobs| {
                 let injector = injector.clone();
@@ -242,7 +338,7 @@ fn deque(producers: usize, workers: usize, local_deques: bool) -> f64 {
                         };
                         match step {
                             Steal::Success(job) => {
-                                drop(job);
+                                run(job);
                                 taken += 1;
                             }
                             Steal::Retry => std::hint::spin_loop(),
@@ -268,42 +364,65 @@ fn deque(producers: usize, workers: usize, local_deques: bool) -> f64 {
         done.store(true, Ordering::Release);
         let taken: u64 = worker_handles.into_iter().map(|h| h.join().unwrap()).sum();
         let secs = start.elapsed().as_secs_f64();
-        assert_eq!(taken, PER_PRODUCER * producers as u64);
-        taken as f64 / secs
+        assert_eq!(taken, load.total());
+        secs
     })
 }
 
 // ==== Report ====
 
+fn header(unit: &str) {
+    print!("{:>4} {:>4}", "P", "C");
+    for kind in KINDS {
+        print!(" {:>12}", kind.name());
+    }
+    println!("   ({unit})");
+}
+
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn bench_mpmc_throughput() {
-    println!("\njobs per second (millions), median of {ROUNDS}; P producers x C workers");
-    println!(
-        "{:>4} {:>4} {:>12} {:>12} {:>12} {:>12}",
-        "P", "C", "treiber", "cb channel", "cb injector", "cb deque"
-    );
+    println!("\nthroughput, empty jobs: millions of jobs per second, median of {ROUNDS}");
+    header("M jobs/s");
     for producers in PRODUCER_COUNTS {
         for workers in WORKER_COUNTS {
-            let t = median((0..ROUNDS).map(|_| treiber(producers, workers)).collect());
-            let c = median((0..ROUNDS).map(|_| crossbeam(producers, workers)).collect());
-            let i = median(
-                (0..ROUNDS)
-                    .map(|_| deque(producers, workers, false))
-                    .collect(),
-            );
-            let d = median(
-                (0..ROUNDS)
-                    .map(|_| deque(producers, workers, true))
-                    .collect(),
-            );
-            println!(
-                "{producers:>4} {workers:>4} {:>12.1} {:>12.1} {:>12.1} {:>12.1}",
-                t / 1e6,
-                c / 1e6,
-                i / 1e6,
-                d / 1e6
-            );
+            let load = Load {
+                producers,
+                workers,
+                per_producer: THROUGHPUT_JOBS,
+                block_every: 0,
+            };
+            print!("{producers:>4} {workers:>4}");
+            for kind in KINDS {
+                let secs = median((0..ROUNDS).map(|_| kind.run(load)).collect());
+                print!(" {:>12.1}", load.total() as f64 / secs / 1e6);
+            }
+            println!();
         }
+    }
+}
+
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn bench_mpmc_blocking() {
+    println!(
+        "\nblocking: {BLOCKING_JOBS} jobs per producer, one in {BLOCK_EVERY} sleeps {BLOCK_FOR:?}; wall time, median of \
+         {ROUNDS}"
+    );
+    header("ms");
+    for (producers, workers) in BLOCKING_SHAPES {
+        let load = Load {
+            producers,
+            workers,
+            per_producer: BLOCKING_JOBS,
+            block_every: BLOCK_EVERY,
+        };
+        print!("{producers:>4} {workers:>4}");
+        for kind in KINDS {
+            let secs = median((0..ROUNDS).map(|_| kind.run(load)).collect());
+            print!(" {:>12.1}", secs * 1e3);
+        }
+        let ideal = (load.total() / BLOCK_EVERY) as f64 * BLOCK_FOR.as_secs_f64() / workers as f64;
+        println!("   ideal {:.1}", ideal * 1e3);
     }
 }

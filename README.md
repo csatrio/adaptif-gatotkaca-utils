@@ -477,24 +477,30 @@ The tests in `tests/treiber_channel*.rs` cover ordering, wakeups, bounds, drops 
 
 A many-producer, many-consumer job queue for a thread pool fed by a few long-lived runtime threads. Each producer
 takes a lane (`queue.lane()`) and pushes into it; a worker reaps a whole lane at once with `queue.try_reap()`, with no
-registration and no state of its own, and runs the chain itself.
+registration and no state of its own, and runs the chain it gets.
 
 - **Intrusive jobs.** The job type implements `TreiberNode` and links through its own `next` field, so the queue never
-  allocates per job. A reaped chain is a `TreiberStackIterator`: jobs a worker drops unrun, and jobs still queued when
-  the last handle drops, are freed with `TreiberNode::drop_node`.
+  allocates per job. Jobs still queued when the last handle drops are freed with `TreiberNode::drop_node`.
 - **One swap per reap.** A lane is one cache line: a Treiber stack and two counters. A reap takes the stack with one
-  swap (an empty lane costs a load) and reverses it, so a chain runs oldest first. Chains of one lane reaped by
-  different workers run side by side, and a worker that blocks holds the rest of its chain.
+  swap (an empty lane costs a load) and reverses it, so a chain runs oldest first.
+- **A blocked worker holds nothing.** The reaping worker keeps the first job and publishes the rest in a chain slot
+  (`max_chains`, 64 by default), then takes its jobs from there one at a time: a compare-and-swap and a store on a
+  cache line nobody else touches while it works. If its first job stays the same for `rescue_after` (50 µs by
+  default), the worker is stuck (in `fsync`, a DNS lookup) and an idle worker takes the chain over; the old owner stops
+  at its next take. The owner pays nothing for this check, and idle workers look at the slots at most every
+  `rescue_after / 2`. Each `GkMpmcChain` yields the jobs of one reap, oldest first; dropping it never loses a job.
 - **Unbounded.** `push` never fails, waits or allocates.
 - **No parking inside.** The pool decides who sleeps. `push` publishes the job with a `SeqCst` compare-and-swap before
   it returns; pair it with a `SeqCst` read-modify-write on the pool's state word, and have a worker do its own before
-  its last `has_work()` re-check (one load per lane), and no wake-up is lost.
-- **Ranking.** Each push stores the lane's push count (one relaxed store) and each reap adds the chain length to its
-  taken count; `try_reap` tries the lane with the largest backlog first, then every lane.
+  its last `has_work()` re-check (one load per lane), and no wake-up is lost. Shared chains have owners, so they do not
+  count as work; but nothing signals when an owner blocks, so while `shared_chains() > 0` a worker should park with a
+  timeout of about `rescue_after`.
+- **Ranking and fairness.** Each push stores the lane's push count (one relaxed store) and each reap adds the chain
+  length to its taken count; `try_reap` reaps the lane with the largest backlog first. Every 16th call per thread it
+  looks for stalled chains before the lanes, so jobs behind a blocked worker are not starved by fresh ones.
 - **Lanes are never freed** while the queue lives (`max_lanes`, 32 by default), so workers scan them while runtimes
-  come and go. A dropped lane is reused by the next `lane()` call; jobs left in it are still reaped, before the new
-  owner's. `lane.drain(f)` takes back what workers have not reaped (for a producer that sees the pool shut down),
-  `queue.drain(f)` does so for every lane.
+  come and go. A dropped lane is reused by the next `lane()` call. `lane.drain(f)` takes back what workers have not
+  reaped (for a producer that sees the pool shut down); `queue.drain(f)` takes every lane and chain slot.
 
 ```rust
 use adaptif_gatotkaca_utils::{GkTreiberMpmc, TreiberNode};
@@ -530,7 +536,7 @@ let workers: Vec<_> = (0..4)
             while let Some(chain) = queue.try_reap() {
                 for task in chain {
                     // Safety: the task is ours now.
-                    drop(unsafe { Box::from_raw(task) });
+                    drop(unsafe { Box::from_raw(task.as_ptr()) });
                     done += 1;
                 }
             }
@@ -542,22 +548,35 @@ let done: u64 = workers.into_iter().map(|w| w.join().unwrap()).sum();
 assert_eq!(done, 100);
 ```
 
-Throughput on an 8-core Apple Silicon machine, millions of boxed jobs per second (P producers, C workers). Treiber
-and the crossbeam-deque workers spin on their queue; crossbeam channel workers use `recv`.
+Measured on an 8-core Apple Silicon machine (P producers, C workers). `reap-only` is `max_chains(0)`: each worker
+keeps its whole reap. Treiber and the crossbeam-deque workers spin on their queue; crossbeam channel workers use
+`recv`; `cb deque` is tokio's model (the injector plus a FIFO deque per worker, filled with `steal_batch_and_pop`).
+
+Blocking jobs, 20,000 per producer, one in 500 sleeping 1 ms (an `fsync` stand-in), wall time in ms:
+
+| P × C | treiber | reap-only | cb channel | cb injector | cb deque | ideal |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 × 4 | 15.9 | 21.6 | 14.6 | 14.2 | 14.1 | 10.0 |
+| 2 × 8 | 16.5 | 50.6 | 14.1 | 14.2 | 14.0 | 10.0 |
+| 4 × 8 | 30.5 | 57.0 | 28.2 | 27.6 | 27.4 | 20.0 |
+
+Empty jobs, millions per second:
 
 | P × C | 1 × 2 | 1 × 4 | 1 × 8 | 2 × 2 | 2 × 4 | 2 × 8 | 4 × 2 | 4 × 4 | 4 × 8 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| treiber mpmc | 15.5 | 27.0 | 12.1 | 11.1 | 11.4 | 8.6 | 10.1 | 14.2 | 7.2 |
-| crossbeam channel | 7.1 | 5.6 | 2.2 | 6.5 | 5.7 | 2.2 | 6.6 | 5.7 | 2.2 |
-| crossbeam-deque `Injector` | 6.9 | 5.7 | 2.2 | 7.1 | 5.6 | 2.2 | 6.5 | 5.6 | 2.3 |
-| crossbeam-deque, tokio model | 11.1 | 6.6 | 2.3 | 9.2 | 6.4 | 2.3 | 9.2 | 6.4 | 2.4 |
+| treiber | 16.8 | 17.7 | 6.9 | 14.4 | 9.3 | 6.2 | 12.7 | 11.5 | 8.9 |
+| reap-only | 21.0 | 21.3 | 11.0 | 11.6 | 15.8 | 10.4 | 19.4 | 17.6 | 6.3 |
+| cb channel | 7.6 | 5.7 | 2.4 | 6.8 | 5.7 | 2.2 | 6.7 | 5.8 | 2.3 |
+| cb injector | 7.6 | 5.7 | 2.2 | 7.0 | 5.6 | 2.3 | 6.3 | 5.6 | 2.3 |
+| cb deque | 11.1 | 6.4 | 2.5 | 9.2 | 6.3 | 2.4 | 9.1 | 6.4 | 2.4 |
 
-The `Injector` row takes one job per steal; the tokio model is the injector plus a FIFO deque per worker, filled with
-`steal_batch_and_pop` and stolen from by the others, so it takes batches like `try_reap`. Treiber varies about ±15%
-between runs. At 8 workers the machine is oversubscribed (8 workers plus the producers on 8 cores).
+The rescue delay costs the jobs behind a blocked worker about `rescue_after` (treiber against crossbeam in the first
+table); sharing chains costs some throughput against `reap-only` on empty jobs, mostly from rescues of owners the OS
+descheduled (these spinning benchmark workers are never parked). Treiber's empty-job numbers vary about ±20% between
+runs. At 8 workers the machine is oversubscribed (8 workers plus the producers on 8 cores).
 
-The tests are in `tests/treiber_mpmc.rs` (they also run under Miri); the measurement is
-`cargo test --release --test bench_treiber_mpmc -- --ignored --nocapture`.
+The tests are in `tests/treiber_mpmc.rs` (they also run under Miri); the measurements are
+`cargo test --release --test bench_treiber_mpmc -- --ignored --nocapture --test-threads 1`.
 
 ## Safety
 

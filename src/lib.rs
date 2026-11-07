@@ -17,7 +17,8 @@
 //!   yourself through [`GkRegionMemory`]).
 //! - [`treiber_channel`]: [`GkTreiberChannel`], a many-producer single-consumer channel made of per-thread Treiber stacks.
 //! - [`treiber_channel::mpmc`]: [`GkTreiberMpmc`], a many-producer many-consumer job queue for thread pools: one lane per
-//!   producer, each worker reaps a whole lane of intrusive jobs at once, oldest first.
+//!   producer, each worker reaps a whole lane of intrusive jobs at once, oldest first, and shares the rest so a blocked
+//!   worker does not hold it.
 //!
 //! The crate's dependencies, [`crossbeam_utils`] and [`nohash_hasher`], are
 //! re-exported at the root, so you can use them without depending on them yourself.
@@ -39,7 +40,8 @@ pub use treiber_channel::channel_memory::{
 };
 pub use treiber_channel::channel_waker::{GkAsyncWaker, GkTaskWaker, GkThreadWaker, GkWaker};
 pub use treiber_channel::mpmc::{
-    GK_MPMC_MAX_LANES, GkMpmcLane, GkTreiberMpmc, GkTreiberMpmcConfig,
+    GK_MPMC_MAX_CHAINS, GK_MPMC_MAX_LANES, GK_MPMC_RESCUE_AFTER, GkMpmcChain, GkMpmcLane,
+    GkTreiberMpmc, GkTreiberMpmcConfig,
 };
 pub use treiber_channel::{
     GK_GROW_NODES, GK_LIFO_SHORT_CHAIN, GK_RETURN_BATCH, GK_SLAB_NODES, GK_SPIN_POLLS, GkReceiver,

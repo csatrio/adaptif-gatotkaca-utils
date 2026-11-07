@@ -4,14 +4,29 @@
 
 - Added `GkTreiberMpmc`, a many-producer many-consumer job queue for thread pools fed by a few runtime threads. Each
   producer pushes into its own lane (`GkMpmcLane`, one `SeqCst` compare-and-swap per push); a worker reaps a whole
-  lane with `try_reap`, without registering: one swap takes the lane's stack, reversed so the chain runs oldest first,
-  as a `TreiberStackIterator`. Jobs are intrusive (`TreiberNode`), so nothing is allocated per job and nothing goes
-  home; jobs dropped unrun are freed with `drop_node`. A lane is one cache line. `try_reap` tries the lane with the
-  largest backlog first (push count minus reaped count). The queue never parks: `has_work` (one load per lane) gives
-  the pool its last re-check, and `GkMpmcLane::drain` / `GkTreiberMpmc::drain` take unreaped jobs back at shutdown.
-  Lanes live in a fixed table (`max_lanes`, 32) freed only with the queue; a dropped lane is reused. Measured 10 to 27
-  M jobs/s against 6 to 11 for crossbeam's channel, crossbeam-deque's `Injector` and tokio's model.
+  lane with `try_reap`, without registering: one swap takes the lane's stack, reversed so the chain runs oldest first.
+  Jobs are intrusive (`TreiberNode`), so nothing is allocated per job and nothing goes home. A lane is one cache line.
+  `try_reap` tries the lane with the largest backlog first (push count minus reaped count). Lanes live in a fixed
+  table (`max_lanes`, `GK_MPMC_MAX_LANES` = 32) freed only with the queue; a dropped lane is reused.
+- A worker blocked in a job does not hold the rest of its reap. The reaping worker keeps the first job and publishes
+  the rest in a chain slot (`max_chains`, `GK_MPMC_MAX_CHAINS` = 64), then takes its jobs from there one at a time (a
+  compare-and-swap and a store on a cache line nobody else touches while it works). When a chain's first job stays the
+  same for `rescue_after` (`GK_MPMC_RESCUE_AFTER` = 50 µs), an idle worker takes the chain over and the old owner stops
+  at its next take. The check costs the owner nothing: idle workers remember, per thread, what they last saw in each
+  slot, and look at most every `rescue_after / 2`. Every 16th `try_reap` per thread looks for stalled chains first.
+  Each slot carries a generation, so a chain yields the jobs of one reap only, oldest first. `max_chains(0)` keeps
+  every reap private; `rescue_after(0)` shares every chain with idle workers at once.
+- `try_reap` returns a `GkMpmcChain`, an iterator of `NonNull<N>`. Dropping a chain never loses a job: the rest stays
+  in its slot, or goes back on its lane when no slot is free; jobs still queued when the last handle drops are freed
+  with `drop_node`.
+- The queue never parks: the pool does. `has_work` (one load per lane) gives a worker its last re-check before
+  parking; shared chains have owners, so they are counted apart by `shared_chains`, and a worker should park with a
+  timeout of about `rescue_after` while it is above 0. `GkMpmcLane::drain` takes back a lane's unreaped jobs and
+  `GkTreiberMpmc::drain` every lane's and chain slot's, for shutdown.
 - `GkTreiberChannelError::TOO_MANY_LANES`.
+- Measured on 8 cores: with 1 ms blocking jobs, wall time within about 2 ms of crossbeam's channel, crossbeam-deque's
+  `Injector` and tokio's model (keeping each reap private took 1.4 to 3.6 times as long); with empty jobs, 6 to 18 M
+  jobs/s against 2 to 11 for those three.
 
 ## 0.14.0
 
