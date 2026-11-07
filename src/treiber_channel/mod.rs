@@ -73,6 +73,7 @@
 
 pub mod channel_memory;
 pub mod channel_waker;
+pub mod mpmc;
 
 use crate::treiber_stack::{GkTreiberPtr, TreiberNode};
 use channel_memory::{GkChannelMemory, GkHeapMemory};
@@ -129,6 +130,8 @@ impl GkTreiberChannelError {
     pub const OUT_OF_MEMORY: Self = Self(7);
     /// A `single_producer` channel already handed out its sender.
     pub const SENDER_TAKEN: Self = Self(8);
+    /// Every lane of a [`GkTreiberMpmc`](crate::GkTreiberMpmc) is held by a producer.
+    pub const TOO_MANY_LANES: Self = Self(9);
 
     /// The numeric code of the error.
     #[inline(always)]
@@ -146,6 +149,7 @@ impl GkTreiberChannelError {
             6 => "invalid treiber channel configuration",
             7 => "the channel memory is exhausted",
             8 => "the single sender was already taken",
+            9 => "every lane is taken",
             _ => "unknown treiber channel error",
         }
     }

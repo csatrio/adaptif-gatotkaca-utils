@@ -11,12 +11,13 @@ developed by [PT Adaptif Sinergi Dinamis](https://adaptif.co.id/).
 | `fast_hashmap` | `FastU64Map<V>`: a `HashMap<u64, V>` that uses the key as its own hash (no SipHash). |
 | `refcounted` | `GkRefCounted<T>`: an `Arc`-like pointer whose reference count lives inside `T` (`GkIntrinsicRefCounted`). |
 | `treiber_stack` | Lock-free Treiber stack helpers on `AtomicPtr`, FIFO/LIFO iterators, and a bounded `TreiberQueue`. |
+| `treiber_channel` | `GkTreiberChannel`: a many-producer, one-consumer channel. `GkTreiberMpmc`: a many-producer, many-consumer job queue for thread pools. |
 
 ## Installation
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-utils = "0.11"
+adaptif-gatotkaca-utils = "0.15"
 ```
 
 The crate re-exports its dependencies, `crossbeam_utils` and `nohash_hasher`,
@@ -471,6 +472,92 @@ an Apple M3 (4 performance + 4 efficiency cores), so from 4 producers up some th
 The tests in `tests/treiber_channel*.rs` cover ordering, wakeups, bounds, drops and leaks. The measurements
 `tests/bench_treiber_channel.rs` and `tests/bench_treiber_channel_memory.rs` compare it with `crossbeam_channel` and
 `std::sync::mpsc`; run them with `cargo test --release --test bench_treiber_channel -- --ignored --nocapture`.
+
+## GkTreiberMpmc
+
+A many-producer, many-consumer job queue for a thread pool fed by a few long-lived runtime threads. Each producer
+takes a lane (`queue.lane()`) and pushes into it; a worker reaps a whole lane at once with `queue.try_reap()`, with no
+registration and no state of its own, and runs the chain itself.
+
+- **Intrusive jobs.** The job type implements `TreiberNode` and links through its own `next` field, so the queue never
+  allocates per job. A reaped chain is a `TreiberStackIterator`: jobs a worker drops unrun, and jobs still queued when
+  the last handle drops, are freed with `TreiberNode::drop_node`.
+- **One swap per reap.** A lane is one cache line: a Treiber stack and two counters. A reap takes the stack with one
+  swap (an empty lane costs a load) and reverses it, so a chain runs oldest first. Chains of one lane reaped by
+  different workers run side by side, and a worker that blocks holds the rest of its chain.
+- **Unbounded.** `push` never fails, waits or allocates.
+- **No parking inside.** The pool decides who sleeps. `push` publishes the job with a `SeqCst` compare-and-swap before
+  it returns; pair it with a `SeqCst` read-modify-write on the pool's state word, and have a worker do its own before
+  its last `has_work()` re-check (one load per lane), and no wake-up is lost.
+- **Ranking.** Each push stores the lane's push count (one relaxed store) and each reap adds the chain length to its
+  taken count; `try_reap` tries the lane with the largest backlog first, then every lane.
+- **Lanes are never freed** while the queue lives (`max_lanes`, 32 by default), so workers scan them while runtimes
+  come and go. A dropped lane is reused by the next `lane()` call; jobs left in it are still reaped, before the new
+  owner's. `lane.drain(f)` takes back what workers have not reaped (for a producer that sees the pool shut down),
+  `queue.drain(f)` does so for every lane.
+
+```rust
+use adaptif_gatotkaca_utils::{GkTreiberMpmc, TreiberNode};
+use std::{ptr::NonNull, sync::atomic::AtomicPtr, thread};
+
+struct Task {
+    next: AtomicPtr<Task>,
+    id: u64,
+}
+
+impl TreiberNode for Task {
+    type Value = u64;
+    fn next(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
+    fn value(&self) -> &u64 {
+        &self.id
+    }
+}
+
+let queue = GkTreiberMpmc::<Task>::new();
+let mut lane = queue.lane().unwrap(); // one per runtime thread
+for id in 0..100 {
+    let task = Box::into_raw(Box::new(Task { next: AtomicPtr::default(), id }));
+    // Safety: a fresh task in no other queue; freed with `Box` if never run.
+    unsafe { lane.push(NonNull::new(task).unwrap()) };
+}
+let workers: Vec<_> = (0..4)
+    .map(|_| {
+        let queue = queue.clone();
+        thread::spawn(move || {
+            let mut done = 0;
+            while let Some(chain) = queue.try_reap() {
+                for task in chain {
+                    // Safety: the task is ours now.
+                    drop(unsafe { Box::from_raw(task) });
+                    done += 1;
+                }
+            }
+            done
+        })
+    })
+    .collect();
+let done: u64 = workers.into_iter().map(|w| w.join().unwrap()).sum();
+assert_eq!(done, 100);
+```
+
+Throughput on an 8-core Apple Silicon machine, millions of boxed jobs per second (P producers, C workers). Treiber
+and the crossbeam-deque workers spin on their queue; crossbeam channel workers use `recv`.
+
+| P × C | 1 × 2 | 1 × 4 | 1 × 8 | 2 × 2 | 2 × 4 | 2 × 8 | 4 × 2 | 4 × 4 | 4 × 8 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| treiber mpmc | 15.5 | 27.0 | 12.1 | 11.1 | 11.4 | 8.6 | 10.1 | 14.2 | 7.2 |
+| crossbeam channel | 7.1 | 5.6 | 2.2 | 6.5 | 5.7 | 2.2 | 6.6 | 5.7 | 2.2 |
+| crossbeam-deque `Injector` | 6.9 | 5.7 | 2.2 | 7.1 | 5.6 | 2.2 | 6.5 | 5.6 | 2.3 |
+| crossbeam-deque, tokio model | 11.1 | 6.6 | 2.3 | 9.2 | 6.4 | 2.3 | 9.2 | 6.4 | 2.4 |
+
+The `Injector` row takes one job per steal; the tokio model is the injector plus a FIFO deque per worker, filled with
+`steal_batch_and_pop` and stolen from by the others, so it takes batches like `try_reap`. Treiber varies about ±15%
+between runs. At 8 workers the machine is oversubscribed (8 workers plus the producers on 8 cores).
+
+The tests are in `tests/treiber_mpmc.rs` (they also run under Miri); the measurement is
+`cargo test --release --test bench_treiber_mpmc -- --ignored --nocapture`.
 
 ## Safety
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.0
+
+- Added `GkTreiberMpmc`, a many-producer many-consumer job queue for thread pools fed by a few runtime threads. Each
+  producer pushes into its own lane (`GkMpmcLane`, one `SeqCst` compare-and-swap per push); a worker reaps a whole
+  lane with `try_reap`, without registering: one swap takes the lane's stack, reversed so the chain runs oldest first,
+  as a `TreiberStackIterator`. Jobs are intrusive (`TreiberNode`), so nothing is allocated per job and nothing goes
+  home; jobs dropped unrun are freed with `drop_node`. A lane is one cache line. `try_reap` tries the lane with the
+  largest backlog first (push count minus reaped count). The queue never parks: `has_work` (one load per lane) gives
+  the pool its last re-check, and `GkMpmcLane::drain` / `GkTreiberMpmc::drain` take unreaped jobs back at shutdown.
+  Lanes live in a fixed table (`max_lanes`, 32) freed only with the queue; a dropped lane is reused. Measured 10 to 27
+  M jobs/s against 6 to 11 for crossbeam's channel, crossbeam-deque's `Injector` and tokio's model.
+- `GkTreiberChannelError::TOO_MANY_LANES`.
+
 ## 0.14.0
 
 - Job nodes no longer record their producer: a node is a link and the payload (16 bytes for a `u64`, was 24), so an
