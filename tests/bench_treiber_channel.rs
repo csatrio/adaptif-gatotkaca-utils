@@ -35,15 +35,18 @@ enum Kind {
     /// `single_producer` (1:1); only measured with one producer.
     TreiberSingle,
     TreiberBounded,
+    /// `lifo`: no reverse, no per-producer order.
+    TreiberLifo,
     CrossbeamUnbounded,
     CrossbeamBounded,
     StdMpsc,
 }
 
-const KINDS: [Kind; 6] = [
+const KINDS: [Kind; 7] = [
     Kind::Treiber,
     Kind::TreiberSingle,
     Kind::TreiberBounded,
+    Kind::TreiberLifo,
     Kind::CrossbeamUnbounded,
     Kind::CrossbeamBounded,
     Kind::StdMpsc,
@@ -56,6 +59,7 @@ impl Kind {
             Kind::Treiber => "treiber",
             Kind::TreiberSingle => "treiber 1:1",
             Kind::TreiberBounded => "treiber b4096",
+            Kind::TreiberLifo => "treiber lifo",
             Kind::CrossbeamUnbounded => "cb unbounded",
             Kind::CrossbeamBounded => "cb b4096",
             Kind::StdMpsc => "std mpsc",
@@ -87,11 +91,14 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 fn treiber(kind: Kind) -> GkTreiberChannel<u64> {
     // BRANCH: one config per treiber contender
     match kind {
-        Kind::TreiberSingle => {
-            GkTreiberChannel::with_config(GkTreiberChannelConfig::DEFAULT.with_single_producer(true))
-                .unwrap()
-        }
+        Kind::TreiberSingle => GkTreiberChannel::with_config(
+            GkTreiberChannelConfig::DEFAULT.with_single_producer(true),
+        )
+        .unwrap(),
         Kind::TreiberBounded => GkTreiberChannel::new_bounded(),
+        Kind::TreiberLifo => {
+            GkTreiberChannel::with_config(GkTreiberChannelConfig::DEFAULT.with_lifo(true)).unwrap()
+        }
         _ => GkTreiberChannel::new(),
     }
 }
@@ -104,7 +111,7 @@ fn throughput(kind: Kind, producers: usize) -> f64 {
         let total = PER_PRODUCER * producers as u64;
         // BRANCH: one setup per contender; each starts its producers, drains on this thread and returns the elapsed time
         let (received, secs) = match kind {
-            Kind::Treiber | Kind::TreiberSingle | Kind::TreiberBounded => {
+            Kind::Treiber | Kind::TreiberSingle | Kind::TreiberBounded | Kind::TreiberLifo => {
                 let channel = treiber(kind);
                 let mut receiver = channel.receiver().unwrap();
                 let senders: Vec<_> = (0..producers).map(|_| channel.sender().unwrap()).collect();
@@ -195,7 +202,7 @@ fn ping_pong(kind: Kind) -> Vec<u64> {
         let mut times = Vec::with_capacity(PING_PONGS);
         // BRANCH: one setup per contender; a client sends i, an echo server sends it back
         match kind {
-            Kind::Treiber | Kind::TreiberSingle | Kind::TreiberBounded => {
+            Kind::Treiber | Kind::TreiberSingle | Kind::TreiberBounded | Kind::TreiberLifo => {
                 let (request, reply) = (treiber(kind), treiber(kind));
                 let mut request_tx = request.sender().unwrap();
                 let mut request_rx = request.receiver().unwrap();
@@ -294,7 +301,7 @@ fn treiber_channel_vs_the_rest() {
                 print!(" {:>14.2}", result / 1e6);
             }
         }
-        println!(" {:>15.2}x", results[2] / results[4]);
+        println!(" {:>15.2}x", results[2] / results[5]);
     }
 
     println!(

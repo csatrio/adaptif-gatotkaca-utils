@@ -170,19 +170,21 @@ impl GkRegionMemory {
         }
         // Safety: the header fits and is aligned; the caller gives us the region exclusively.
         unsafe {
-            base.as_ptr().cast::<GkRegionHeader>().write(GkRegionHeader {
-                len,
-                lock: AtomicBool::new(false),
-                in_use: AtomicUsize::new(0),
-                bump: UnsafeCell::new(Self::HEADER_LEN),
-                classes: UnsafeCell::new(
-                    [GkRegionClass {
-                        size: 0,
-                        align: 0,
-                        head: std::ptr::null_mut(),
-                    }; REGION_CLASSES],
-                ),
-            })
+            base.as_ptr()
+                .cast::<GkRegionHeader>()
+                .write(GkRegionHeader {
+                    len,
+                    lock: AtomicBool::new(false),
+                    in_use: AtomicUsize::new(0),
+                    bump: UnsafeCell::new(Self::HEADER_LEN),
+                    classes: UnsafeCell::new(
+                        [GkRegionClass {
+                            size: 0,
+                            align: 0,
+                            head: std::ptr::null_mut(),
+                        }; REGION_CLASSES],
+                    ),
+                })
         };
         Ok(Self { base })
     }
@@ -254,7 +256,12 @@ unsafe impl GkChannelMemory for GkRegionMemory {
         let (size, align) = Self::block_of(layout);
         let guard = self.lock();
         // Safety: `bump` and `classes` are only touched under the lock.
-        let (bump, classes) = unsafe { (&mut *guard.header.bump.get(), &mut *guard.header.classes.get()) };
+        let (bump, classes) = unsafe {
+            (
+                &mut *guard.header.bump.get(),
+                &mut *guard.header.classes.get(),
+            )
+        };
         // BRANCH: reuse a freed block of the same shape first
         if let Some(class) = classes
             .iter_mut()

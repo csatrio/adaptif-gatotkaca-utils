@@ -383,9 +383,10 @@ assert!(stack.is_empty());
 
 A many-producer, one-consumer channel built from one Treiber stack set per producing thread. Each producer owns a
 `GkSender` with its own pre-allocated pool of job nodes, so a warm sender never allocates and producers never touch each
-other's cache lines. The receiver takes every producer's outbox with one swap each and hands the jobs out in order
-(FIFO per producer, unspecified between producers). `recv` moves the value out to the receiver, which owns and drops it;
-the emptied node goes back to its sender at once, in batches, ready for the next job.
+other's cache lines. The receiver works in laps over the producers: it takes one producer's outbox with a single swap
+(an empty outbox costs only a load), hands its jobs out in order (FIFO per producer, unspecified between producers) and
+moves on to the next; chains are never joined or walked to find a tail. `recv` moves the value out to the receiver, which
+owns and drops it; the emptied node goes back to its sender at once, in batches, ready for the next job.
 
 ```rust
 use adaptif_gatotkaca_utils::GkTreiberChannel;
@@ -420,9 +421,15 @@ assert_eq!(received, 400);
 the receiver, and `try_send` returns `GkTrySendError::Full`. An unbounded sender that runs out of nodes grows by a whole
 chunk of `GK_GROW_NODES` (4096) nodes in one allocation and keeps it until it is dropped; `GkSender::shrink()` frees the
 chunks whose nodes are all back home. `GkTreiberChannel::with_config(GkTreiberChannelConfig)` sets the slab size, chunk
-size, receiver spin, return batch, bound and `single_producer` (a 1:1 channel); every field defaults to its `GK_*`
-constant. The receiver spins briefly, then sleeps; the first producer to find it asleep wakes it. Memory: about 97 KiB
-per sender while idle.
+size, receiver spin, return batch, bound, `single_producer` (a 1:1 channel) and `lifo`; every field defaults to its
+`GK_*` constant. The receiver spins briefly, then sleeps; the first producer to find it asleep wakes it. Memory: about
+97 KiB per sender while idle.
+
+`lifo` is for work that needs no ordering: the receiver skips the reverse that makes each producer's chain oldest-first
+and hands it out newest-first. With two or more producers that is the fastest mode (see the benchmark). A `lifo`
+receiver that catches up with its producers paces its next take with a bounded `Backoff::spin` (under a microsecond),
+so batches build up instead of a cache-line tug of war; idle receivers never wait, so latency is unchanged. With one
+producer FIFO is still faster, because the reverse keeps the receiver behind the producer for free.
 
 Need more throughput? Raise `slab_nodes` (`GkTreiberChannelConfig::DEFAULT.with_slab_nodes(65_536)`): each sender then
 has more jobs in flight before it waits or grows, at the cost of memory per sender.
@@ -441,20 +448,22 @@ Throughput in millions of `u64` messages per second, with the default configurat
 chunks), 500,000 messages per producer, one receiver draining until every sender is gone, median of 5 runs. Measured on
 an Apple M3 (4 performance + 4 efficiency cores), so from 4 producers up some threads run on efficiency cores.
 
-| Producers | treiber | treiber 1:1 | treiber bounded | crossbeam unbounded | crossbeam bounded(4096) | std mpsc |
-|---|---|---|---|---|---|---|
-| 1 | 251 | 251 | 157 | 99 | 105 | 108 |
-| 2 | 231 | – | 178 | 115 | 128 | 43 |
-| 3 | 220 | – | 195 | 127 | 81 | 47 |
-| 4 | 218 | – | 181 | 127 | 49 | 13 |
-| 5 | 220 | – | 181 | 121 | 35 | 17 |
-| 6 | 216 | – | 179 | 110 | 64 | 14 |
+| Producers | treiber | treiber 1:1 | treiber bounded | treiber lifo | crossbeam unbounded | crossbeam bounded(4096) | std mpsc |
+|---|---|---|---|---|---|---|---|
+| 1 | 243 | 247 | 105 | 92 | 99 | 106 | 109 |
+| 2 | 262 | – | 184 | 409 | 121 | 130 | 45 |
+| 3 | 256 | – | 194 | 391 | 126 | 64 | 43 |
+| 4 | 246 | – | 191 | 377 | 131 | 49 | 12 |
+| 5 | 245 | – | 190 | 376 | 128 | 39 | 18 |
+| 6 | 245 | – | 187 | 379 | 102 | 24 | 16 |
 
 - `treiber`: `GkTreiberChannel::new()` (unbounded). `treiber 1:1`: `single_producer`, measured with one producer only.
   `treiber bounded`: `new_bounded()`, 4096 jobs per sender; crossbeam's bound of 4096 is for the whole channel.
-- The 1-producer row varies most between runs (the unbounded treiber measured 107 to 251 in back-to-back runs).
-- Ping-pong round trip (send one value, wait for the echo), in microseconds: treiber p50 0.3 / p99 0.4, crossbeam
-  unbounded 0.2 / 0.8, crossbeam bounded 0.2 / 0.2, std mpsc 1.9 / 4.5.
+  `treiber lifo`: `with_lifo(true)`, unbounded.
+- The 1-producer rows vary most between runs (the unbounded treiber measured 107 to 251 in back-to-back runs, the
+  bounded one 105 to 157).
+- Ping-pong round trip (send one value, wait for the echo), in microseconds: treiber p50 0.4 / p99 0.4 (lifo 0.3 / 0.4),
+  crossbeam unbounded 0.2 / 0.8, crossbeam bounded 0.2 / 0.2, std mpsc 1.9 / 3.8.
 - A bigger slab is faster: with `slab_nodes(65_536)`, bounded treiber measured 232 to 274 across 1 to 6 producers.
 
 The tests in `tests/treiber_channel*.rs` cover ordering, wakeups, bounds, drops and leaks. The measurements

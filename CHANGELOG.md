@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.13.0
+
+- `GkTreiberChannelConfig::lifo` (`with_lifo`): the receiver hands each producer's chain out newest-first instead of
+  reversing it, for work that needs no ordering. With two or more producers it measured 376 to 409 M msgs/s against
+  245 to 262 for FIFO. A `lifo` receiver that catches up with its producers paces its next take with `Backoff::spin`
+  (bounded, reset by a long chain or an idle lap; `GK_LIFO_SHORT_CHAIN` is the chain length that counts as caught up),
+  so batches build up; latency is unchanged.
+- The receiver now works in laps: one producer's outbox per take, handed out to the end before the next producer's,
+  instead of taking every outbox and joining the chains. Nothing is walked to find a tail, each producer gets one turn
+  per lap, and the receiver parks only after a whole lap found nothing. FIFO throughput went up across the board (1:1
+  from 176 to 247 M msgs/s).
+- Removed `GkReceiver::collect`: with laps, new jobs are picked up as the receiver moves on, and nothing is chained.
+- The receiver's return batch reuses the chain's own links instead of rewriting each node's `next`.
+
 ## 0.12.0
 
 - Added `GkTreiberChannel`, a many-producer single-consumer channel built from per-thread Treiber stacks

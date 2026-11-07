@@ -14,8 +14,9 @@ use std::{
     pin::pin,
     ptr::NonNull,
     sync::{
-        Arc, Condvar, Mutex, mpsc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicIsize, AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -258,12 +259,14 @@ impl Counted {
 unsafe impl GkChannelMemory for Counted {
     fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.live.fetch_add(layout.size() as isize, Ordering::SeqCst);
+        self.live
+            .fetch_add(layout.size() as isize, Ordering::SeqCst);
         GkHeapMemory.allocate(layout)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        self.live.fetch_sub(layout.size() as isize, Ordering::SeqCst);
+        self.live
+            .fetch_sub(layout.size() as isize, Ordering::SeqCst);
         unsafe { GkHeapMemory.deallocate(ptr, layout) }
     }
 }
@@ -311,7 +314,8 @@ fn many_channels_share_one_region_and_give_it_back() {
     assert_eq!(region.in_use(), 0);
     // Freed blocks are reused: a second round fits in the same region.
     for _ in 0..3 {
-        let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config, region).unwrap();
+        let channel =
+            GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config, region).unwrap();
         run_traffic(&channel, 3, 1_000);
     }
     assert_eq!(region.in_use(), 0);
@@ -329,7 +333,8 @@ fn a_full_region_reports_out_of_memory_without_leaking() {
 
     let mut mapping = Mapping::new(64 * 1024);
     let region = mapping.region();
-    let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(512), region).unwrap();
+    let channel =
+        GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(512), region).unwrap();
     let mut receiver = channel.receiver().unwrap();
     let mut senders = Vec::new();
     // BRANCH: senders until the region is full; the failing one leaves nothing behind
@@ -421,7 +426,8 @@ fn single_producer_ping_pong() {
             GkTreiberChannel::<u64>::with_config(config).unwrap(),
             GkTreiberChannel::<u64>::with_config(config).unwrap(),
         );
-        let (mut request_tx, mut request_rx) = (request.sender().unwrap(), request.receiver().unwrap());
+        let (mut request_tx, mut request_rx) =
+            (request.sender().unwrap(), request.receiver().unwrap());
         let (mut reply_tx, mut reply_rx) = (reply.sender().unwrap(), reply.receiver().unwrap());
         let server = thread::spawn(move || {
             while let Ok(value) = request_rx.recv() {
@@ -445,9 +451,11 @@ fn small_hooks_under_contention() {
     let config = small(4).with_return_batch(3).with_spin_polls(2);
     // BRANCH: unbounded and bounded in a region, then a single-producer channel on the heap
     for bounded in [false, true] {
-        let channel =
-            GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config.with_bounded(bounded), region)
-                .unwrap();
+        let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(
+            config.with_bounded(bounded),
+            region,
+        )
+        .unwrap();
         run_traffic(&channel, 3, 20);
         drop(channel);
         assert_eq!(region.in_use(), 0);

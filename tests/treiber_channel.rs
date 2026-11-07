@@ -12,7 +12,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // ==== Helpers ====
@@ -145,38 +145,29 @@ fn unbounded_grows_by_chunks_and_shrink_frees_them() {
 }
 
 #[test]
-fn collect_chains_new_jobs_after_the_pending_ones() {
+fn senders_take_turns_one_chain_each() {
     within(10, || {
         let channel = GkTreiberChannel::<(u8, u32)>::new();
         let mut a = channel.sender().unwrap();
         let mut b = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
-        for i in 0..4 {
-            a.send((0, i)).unwrap();
-        }
-        // One job taken: three of `a` stay pending in the receiver's chain.
-        assert_eq!(receiver.recv().unwrap(), (0, 0));
-        assert!(!receiver.collect());
-        for i in 4..8 {
-            a.send((0, i)).unwrap();
-        }
         for i in 0..3 {
+            a.send((0, i)).unwrap();
             b.send((1, i)).unwrap();
         }
-        // BRANCH: collect appends behind the pending jobs, so `a`'s old jobs come first, then both producers in order
-        assert!(receiver.collect());
-        let mut seen_a = vec![];
-        let mut seen_b = vec![];
-        while let Some((from, n)) = receiver.try_recv() {
-            // BRANCH: split by producer to check per-producer order
-            if from == 0 {
-                seen_a.push(n);
-            } else {
-                seen_b.push(n);
-            }
-        }
-        assert_eq!(seen_a, vec![1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(seen_b, vec![0, 1, 2]);
+        // Each sender's chain is handed out whole, oldest first, before the next sender's.
+        let got: Vec<(u8, u32)> = std::iter::from_fn(|| receiver.try_recv()).collect();
+        assert_eq!(got.len(), 6);
+        let first = got[0].0;
+        assert!(got[..3].iter().all(|&(from, _)| from == first));
+        assert_eq!(
+            got[..3].iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            got[3..].iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     });
 }
 
@@ -490,6 +481,7 @@ fn config_defaults_match_the_constants() {
     assert_eq!(config.grow_nodes, GK_GROW_NODES);
     assert_eq!(config.return_batch, GK_RETURN_BATCH);
     assert!(!config.bounded);
+    assert!(!config.lifo);
     assert!(GkTreiberChannel::<u64>::new_bounded().config().bounded);
 }
 
@@ -630,6 +622,213 @@ fn small_channel_many_producers_and_endings() {
                     let (id, seq) = ((*value / 100) as usize, *value % 100);
                     assert_eq!(seq, next[id]);
                     next[id] += 1;
+                    count += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        // BRANCH: drop the receiver while producers may still be sending
+        if receiver_first {
+            drop(receiver);
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        } else {
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(count, 60);
+            drop(receiver);
+        }
+    }
+}
+
+// ==== Lifo ====
+
+fn lifo() -> GkTreiberChannelConfig {
+    GkTreiberChannelConfig::DEFAULT.with_lifo(true)
+}
+
+#[test]
+fn lifo_hands_out_each_chain_newest_first() {
+    within(10, || {
+        let channel = GkTreiberChannel::<u32>::with_config(lifo()).unwrap();
+        let mut sender = channel.sender().unwrap();
+        let mut receiver = channel.receiver().unwrap();
+        for i in 0..5 {
+            sender.send(i).unwrap();
+        }
+        let got: Vec<u32> = std::iter::from_fn(|| receiver.try_recv()).collect();
+        assert_eq!(got, vec![4, 3, 2, 1, 0]);
+        // A new chain is taken once the current one is done.
+        sender.send(9).unwrap();
+        assert_eq!(receiver.try_recv(), Some(9));
+        assert_eq!(receiver.try_recv(), None);
+    });
+}
+
+/// Every job arrives exactly once, with senders coming and going while the receiver runs.
+fn exactly_once_with_churn(config: GkTreiberChannelConfig, producers: u64, per: u64) {
+    let channel = GkTreiberChannel::<u64>::with_config(config).unwrap();
+    let mut receiver = channel.receiver().unwrap();
+    let handles: Vec<_> = (0..producers)
+        .map(|p| {
+            let channel = channel.clone();
+            // Keeps the sender count above zero between the short-lived senders, so the receiver does not see a
+            // disconnect early.
+            let keeper = channel.sender().unwrap();
+            thread::spawn(move || {
+                let _keeper = keeper;
+                // BRANCH: several short-lived senders per thread, so registration and retirement happen mid-run
+                for part in 0..4 {
+                    let mut sender = channel.sender().unwrap();
+                    for i in part * per / 4..(part + 1) * per / 4 {
+                        sender.send(p * per + i).unwrap();
+                    }
+                }
+            })
+        })
+        .collect();
+    drop(channel);
+    let mut seen = vec![false; (producers * per) as usize];
+    let mut count = 0;
+    while let Ok(value) = receiver.recv() {
+        assert!(
+            !std::mem::replace(&mut seen[value as usize], true),
+            "duplicate {value}"
+        );
+        count += 1;
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(count, producers * per);
+}
+
+#[test]
+fn lifo_delivers_every_job_exactly_once() {
+    within(60, || {
+        exactly_once_with_churn(lifo().with_slab_nodes(64).with_grow_nodes(64), 4, 40_000)
+    });
+}
+
+#[test]
+fn fifo_delivers_every_job_exactly_once_with_churn() {
+    within(60, || {
+        exactly_once_with_churn(
+            GkTreiberChannelConfig::DEFAULT
+                .with_slab_nodes(64)
+                .with_grow_nodes(64),
+            4,
+            40_000,
+        )
+    });
+}
+
+#[test]
+fn many_senders_each_get_a_turn() {
+    within(60, || {
+        exactly_once_with_churn(lifo().with_slab_nodes(16).with_grow_nodes(16), 40, 2_000);
+        exactly_once_with_churn(
+            GkTreiberChannelConfig::DEFAULT
+                .with_slab_nodes(16)
+                .with_grow_nodes(16),
+            40,
+            2_000,
+        );
+    });
+}
+
+#[test]
+fn lifo_receiver_times_out_and_is_woken_like_fifo() {
+    within(10, || {
+        let channel =
+            GkTreiberChannel::<u64>::with_config(lifo().with_single_producer(true)).unwrap();
+        let mut sender = channel.sender().unwrap();
+        let mut receiver = channel.receiver().unwrap();
+        // A short chain, then idle: the pacing must not keep the receiver from parking or timing out.
+        sender.send(1).unwrap();
+        assert_eq!(receiver.recv().unwrap(), 1);
+        let start = Instant::now();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(30)),
+            Err(GkTreiberChannelError::TIMEOUT)
+        );
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        // Parked, then woken by a send.
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            sender.send(2).unwrap();
+            sender
+        });
+        assert_eq!(receiver.recv().unwrap(), 2);
+        drop(producer.join().unwrap());
+        assert_eq!(receiver.recv(), Err(GkTreiberChannelError::DISCONNECTED));
+    });
+}
+
+#[test]
+fn lifo_single_producer_drops_every_payload_once() {
+    within(10, || {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let channel =
+                GkTreiberChannel::<Tracked>::with_config(lifo().with_single_producer(true))
+                    .unwrap();
+            let mut sender = channel.sender().unwrap();
+            let mut receiver = channel.receiver().unwrap();
+            for _ in 0..10 {
+                sender.send(Tracked(drops.clone())).unwrap();
+            }
+            drop(receiver.try_recv());
+            // The rest stay with the receiver and are dropped with it.
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 10);
+    });
+}
+
+/// Small enough for Miri: lifo with senders coming and going, and both endings.
+#[test]
+fn small_lifo_channel_with_churn() {
+    let config = lifo()
+        .with_slab_nodes(4)
+        .with_grow_nodes(3)
+        .with_return_batch(3)
+        .with_spin_polls(2);
+    // BRANCH: receiver dropped last and first
+    for receiver_first in [false, true] {
+        let channel = GkTreiberChannel::<Box<u64>>::with_config(config).unwrap();
+        let mut receiver = channel.receiver().unwrap();
+        let handles: Vec<_> = (0..3u64)
+            .map(|id| {
+                let channel = channel.clone();
+                let keeper = channel.sender().unwrap();
+                thread::spawn(move || {
+                    let _keeper = keeper;
+                    // BRANCH: two short-lived senders per thread
+                    for part in 0..2u64 {
+                        // BRANCH: the receiver may already be gone in the receiver-first ending
+                        let Ok(mut sender) = channel.sender() else {
+                            return;
+                        };
+                        for i in part * 10..(part + 1) * 10 {
+                            // BRANCH: the receiver may already be gone in the receiver-first ending
+                            if sender.send(Box::new(id * 100 + i)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(channel);
+        let mut seen = [false; 300];
+        let limit = if receiver_first { 10 } else { usize::MAX };
+        let mut count = 0;
+        while count < limit {
+            match receiver.recv() {
+                Ok(value) => {
+                    assert!(!std::mem::replace(&mut seen[*value as usize], true));
                     count += 1;
                 }
                 Err(_) => break,

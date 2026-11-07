@@ -33,9 +33,10 @@
 //! receiver publishes the waiter, runs a `SeqCst` fence and polls. Either the producer sees the waiter or the receiver
 //! sees the job, and the send pays for no separate fence.
 //!
-//! A poll takes every outbox with one atomic swap each, reverses each chain (FIFO per producer) and links the chains
-//! after the chain still pending, so a wakeup that arrives meanwhile is simply chained on (see
-//! [`GkReceiver::collect`]).
+//! The receiver works in laps over its senders: it takes one sender's outbox with one atomic swap (an empty outbox
+//! costs only a load), reverses the chain (FIFO per producer), hands it out to the end and moves on to the next sender.
+//! Chains are never joined, so nothing is walked to find a tail, and every sender gets one turn per lap. It parks only
+//! after a whole lap found nothing.
 //!
 //! # Lifetime of a thread channel
 //!
@@ -60,6 +61,13 @@
 //! directly by the receiver.
 //!
 //! Order is FIFO per producer and unspecified between producers.
+//!
+//! # No ordering
+//!
+//! [`GkTreiberChannelConfig::lifo`] skips the reverse: each taken outbox is handed out as it is, newest first, so the
+//! receiver never walks a chain before handing it out. Use it when order does not matter and throughput does. A `lifo`
+//! receiver that finds itself caught up with the producers (short chains) paces its next take with a bounded spin so
+//! batches build up instead of a cache-line tug of war.
 
 // ==== Import Definition ====
 
@@ -72,17 +80,15 @@ use channel_waker::{GkAsyncWaker, GkThreadWaker, GkWaker};
 use crossbeam_utils::{Backoff, CachePadded};
 
 use std::{
+    alloc::Layout,
     fmt,
+    future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
-    alloc::Layout,
-    future::Future,
     ops::Deref,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::{
-        atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering, fence},
-    },
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering, fence},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -97,6 +103,9 @@ pub const GK_GROW_NODES: usize = 4096;
 pub const GK_SPIN_POLLS: usize = 16;
 /// Default for [`GkTreiberChannelConfig::return_batch`].
 pub const GK_RETURN_BATCH: usize = 64;
+/// A `lifo` receiver that drained a chain shorter than this is caught up with its producers and paces its next take
+/// (see [`GkTreiberChannelConfig::lifo`]).
+pub const GK_LIFO_SHORT_CHAIN: usize = 64;
 
 // ==== Error Definition ====
 
@@ -207,6 +216,17 @@ pub struct GkTreiberChannelConfig {
     /// One sender for the channel's whole life (a 1:1 channel): the second `sender()` fails with `SENDER_TAKEN`, and the
     /// receiver polls that sender's outbox directly instead of walking its list of senders.
     pub single_producer: bool,
+    /// Skip the reverse that makes order FIFO per producer: each sender's taken chain is handed out as it is, newest
+    /// first. For work that needs no ordering.
+    ///
+    /// Without the reverse the receiver is faster than a producer, so it would catch up and take tiny chains in
+    /// lock-step with it, each take moving the outbox cache line between cores. A `lifo` receiver therefore paces
+    /// itself: after draining a chain shorter than [`GK_LIFO_SHORT_CHAIN`] it waits with `Backoff::spin` (growing to
+    /// 64 spin hints, under a microsecond) before the next take, so a batch builds up; a long chain or an idle lap
+    /// resets the wait. Idle and lightly loaded receivers never wait, so latency stays as in FIFO. Pays off with two
+    /// or more producers; with one producer FIFO is still faster (the reverse keeps the receiver behind the producer
+    /// for free).
+    pub lifo: bool,
 }
 
 impl GkTreiberChannelConfig {
@@ -218,6 +238,7 @@ impl GkTreiberChannelConfig {
         return_batch: GK_RETURN_BATCH,
         bounded: false,
         single_producer: false,
+        lifo: false,
     };
 
     /// Sets [`slab_nodes`](Self::slab_nodes).
@@ -253,6 +274,12 @@ impl GkTreiberChannelConfig {
     /// Sets [`single_producer`](Self::single_producer).
     pub const fn with_single_producer(mut self, single_producer: bool) -> Self {
         self.single_producer = single_producer;
+        self
+    }
+
+    /// Sets [`lifo`](Self::lifo).
+    pub const fn with_lifo(mut self, lifo: bool) -> Self {
+        self.lifo = lifo;
         self
     }
 
@@ -395,7 +422,10 @@ fn orphan<T, M: GkChannelMemory>() -> *mut GkJobNode<T, M> {
 /// # Safety
 /// `node` must be valid, owned by the caller and in no stack; `outbox` must belong to the caller's thread channel.
 #[inline(always)]
-unsafe fn submit<T, M: GkChannelMemory>(outbox: &AtomicPtr<GkJobNode<T, M>>, node: *mut GkJobNode<T, M>) {
+unsafe fn submit<T, M: GkChannelMemory>(
+    outbox: &AtomicPtr<GkJobNode<T, M>>,
+    node: *mut GkJobNode<T, M>,
+) {
     let mut head = outbox.load(Ordering::Relaxed);
     loop {
         // Safety: the node is ours until the CAS publishes it.
@@ -450,7 +480,11 @@ unsafe fn return_chain<T, M: GkChannelMemory>(
 /// # Safety
 /// Same as [`return_chain`].
 #[cold]
-unsafe fn return_orphaned<T, M: GkChannelMemory>(channel: *const GkThreadChannel<T, M>, _first: *mut GkJobNode<T, M>, count: usize) {
+unsafe fn return_orphaned<T, M: GkChannelMemory>(
+    channel: *const GkThreadChannel<T, M>,
+    _first: *mut GkJobNode<T, M>,
+    count: usize,
+) {
     // Every node lives in the slab or a chunk, both freed with the channel: only the counts are released.
     // Safety: the nodes held `count` counts; the channel is alive until they are released.
     unsafe { release(channel, count as isize) };
@@ -561,7 +595,8 @@ unsafe fn free_chunk<T, M: GkChannelMemory>(memory: &M, chunk: *mut GkChunk, len
 /// # Safety
 /// `slab` must come from [`alloc_slab`] on a clone of `memory` with the same `len`, and not be used again.
 unsafe fn free_slab<T, M: GkChannelMemory>(memory: &M, slab: *mut GkJobNode<T, M>, len: usize) {
-    let layout = Layout::array::<GkJobNode<T, M>>(len).expect("slab layout was valid when allocated");
+    let layout =
+        Layout::array::<GkJobNode<T, M>>(len).expect("slab layout was valid when allocated");
     // BRANCH: an empty slab took no memory
     if layout.size() != 0 {
         // Safety: forwarded from this function's contract.
@@ -788,7 +823,8 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory + Default> Default for GkTreiberCha
 impl<T: Send, W: GkWaker, M: GkChannelMemory + Default> GkTreiberChannel<T, W, M> {
     /// Creates an unbounded channel with the default configuration.
     pub fn new() -> Self {
-        Self::with_memory(GkTreiberChannelConfig::DEFAULT, M::default()).expect("default memory allocates")
+        Self::with_memory(GkTreiberChannelConfig::DEFAULT, M::default())
+            .expect("default memory allocates")
     }
 
     /// Creates a bounded channel with the default configuration: every sender owns exactly
@@ -796,8 +832,11 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory + Default> GkTreiberChannel<T, W, M
     /// receiver has not taken yet, [`GkSender::send`] waits (spinning, then yielding) and [`GkSender::try_send`] returns
     /// `Full`. The bound is per sender, so the channel holds at most `senders * slab_nodes` jobs.
     pub fn new_bounded() -> Self {
-        Self::with_memory(GkTreiberChannelConfig::DEFAULT.with_bounded(true), M::default())
-            .expect("default memory allocates")
+        Self::with_memory(
+            GkTreiberChannelConfig::DEFAULT.with_bounded(true),
+            M::default(),
+        )
+        .expect("default memory allocates")
     }
 
     /// Creates a channel with `config`. Fails with `INVALID_CONFIG` (allocating nothing) if
@@ -811,7 +850,10 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
     /// Creates a channel whose every allocation (shared state, thread channels, slabs, heap nodes, the receiver's waker)
     /// comes from `memory`. Fails with `INVALID_CONFIG` if `config` is rejected and with `OUT_OF_MEMORY` if `memory` has
     /// no room; neither error allocates.
-    pub fn with_memory(config: GkTreiberChannelConfig, memory: M) -> Result<Self, GkTreiberChannelError> {
+    pub fn with_memory(
+        config: GkTreiberChannelConfig,
+        memory: M,
+    ) -> Result<Self, GkTreiberChannelError> {
         config.validate()?;
         let shared = GkSharedRef::new(GkShared {
             waiter: CachePadded::new(AtomicPtr::new(ptr::null_mut())),
@@ -912,7 +954,10 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
 
     /// Takes the single receiver, which sleeps and is woken with `waker`. Fails with `RECEIVER_TAKEN` if it was taken
     /// already, and with `OUT_OF_MEMORY` if the memory has no room for the waker (the receiver can be taken again).
-    pub fn receiver_with_waker(&self, waker: W) -> Result<GkReceiver<T, W, M>, GkTreiberChannelError> {
+    pub fn receiver_with_waker(
+        &self,
+        waker: W,
+    ) -> Result<GkReceiver<T, W, M>, GkTreiberChannelError> {
         // BRANCH: only one receiver may exist
         if self.shared.receiver_taken.swap(true, Ordering::AcqRel) {
             return Err(GkTreiberChannelError::RECEIVER_TAKEN);
@@ -926,10 +971,14 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
         let config = self.shared.config;
         Ok(GkReceiver {
             head: ptr::null_mut(),
-            tail: ptr::null_mut(),
+            cursor: ptr::null_mut(),
+            cursor_prev: ptr::null_mut(),
             returns: GkReturnBatch::EMPTY,
             channels: ptr::null_mut(),
             single: config.single_producer,
+            lifo: config.lifo,
+            chain_len: 0,
+            pace: Backoff::new(),
             published: false,
             return_batch: config.return_batch,
             spin_polls: config.spin_polls,
@@ -1046,7 +1095,12 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
     fn grow(&mut self) -> Option<*mut GkJobNode<T, M>> {
         let len = self.grow_nodes;
         let (layout, _) = chunk_layout::<T, M>(len)?;
-        let chunk = self.shared.memory.allocate(layout)?.as_ptr().cast::<GkChunk>();
+        let chunk = self
+            .shared
+            .memory
+            .allocate(layout)?
+            .as_ptr()
+            .cast::<GkChunk>();
         // Safety: the channel lives at least as long as this sender, and only the owner changes its chunk list.
         let chunks = unsafe { &(*self.channel).chunks };
         // Safety: fresh memory for the header and `len` nodes.
@@ -1060,7 +1114,14 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
         chunks.store(chunk, Ordering::Relaxed);
         self.allocated += len;
         // Safety: as above.
-        Some(unsafe { link_nodes(chunk_nodes::<T, M>(chunk), len, self.channel, ptr::null_mut()) })
+        Some(unsafe {
+            link_nodes(
+                chunk_nodes::<T, M>(chunk),
+                len,
+                self.channel,
+                ptr::null_mut(),
+            )
+        })
     }
 
     /// Frees the chunks this sender grew into whose nodes are all at home (not sent, or sent and received), and
@@ -1076,7 +1137,11 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
         }
         // Every node at home goes to `local`, so the count per chunk below is complete.
         // Safety: the channel lives at least as long as this sender; the swapped chain is ours.
-        let returned = unsafe { (*self.channel).inbox.swap(ptr::null_mut(), Ordering::Acquire) };
+        let returned = unsafe {
+            (*self.channel)
+                .inbox
+                .swap(ptr::null_mut(), Ordering::Acquire)
+        };
         let mut node = returned;
         while !node.is_null() {
             // Safety: the swapped chain is ours.
@@ -1140,7 +1205,11 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
     ///
     /// # Safety
     /// `first` must be the sender's chunk list and `hint` null or one of its chunks.
-    unsafe fn chunk_of(first: *mut GkChunk, hint: *mut GkChunk, node: *mut GkJobNode<T, M>) -> *mut GkChunk {
+    unsafe fn chunk_of(
+        first: *mut GkChunk,
+        hint: *mut GkChunk,
+        node: *mut GkJobNode<T, M>,
+    ) -> *mut GkChunk {
         let contains = |chunk: *mut GkChunk| {
             let start = chunk_nodes::<T, M>(chunk);
             // Safety: forwarded from this function's contract.
@@ -1237,10 +1306,12 @@ impl<T, M: GkChannelMemory> GkReturnBatch<T, M> {
 /// [`GkAsyncWaker`] such as [`GkTaskWaker`](crate::GkTaskWaker), [`poll_recv`](Self::poll_recv) and
 /// [`recv_async`](Self::recv_async) receive from async code on any executor.
 pub struct GkReceiver<T, W: GkWaker = GkThreadWaker, M: GkChannelMemory = GkHeapMemory> {
-    /// Jobs taken from the outboxes and not handed out yet, oldest first: `head` is next, `tail` is last. A poll appends
-    /// its chains after `tail`, so a wakeup that arrives while jobs are pending is just chained on.
+    /// The jobs of the one outbox taken last, not handed out yet: `head` is next. A poll runs only once it is empty.
     head: *mut GkJobNode<T, M>,
-    tail: *mut GkJobNode<T, M>,
+    /// Where the lap over the senders stands: the next sender to poll (null at the end of the list) and the one before
+    /// it (null at the front), needed to unlink a retired sender.
+    cursor: *mut GkThreadChannel<T, M>,
+    cursor_prev: *mut GkThreadChannel<T, M>,
     /// Emptied nodes on their way home. Never holds anything while `head` is null, so an idle receiver strands no node.
     returns: GkReturnBatch<T, M>,
     /// Thread channels seen so far, linked through `registry_next` (no allocation to track them). In a
@@ -1249,6 +1320,13 @@ pub struct GkReceiver<T, W: GkWaker = GkThreadWaker, M: GkChannelMemory = GkHeap
     channels: *mut GkThreadChannel<T, M>,
     /// The channel is `single_producer`.
     single: bool,
+    /// The channel is `lifo`: chains are handed out as taken, without the reverse.
+    lifo: bool,
+    /// Jobs handed out from the chain taken last.
+    chain_len: usize,
+    /// `lifo` only: grows while the chains stay short (the receiver is caught up with the producers) and paces the next
+    /// take so a batch can build up; reset by a long chain or an idle lap.
+    pace: Backoff,
     /// `poll_recv` returned `Pending` with the waker still published; taken back on the next receive.
     published: bool,
     return_batch: usize,
@@ -1273,21 +1351,17 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
         self.recv_until(Some(Instant::now() + timeout))
     }
 
-    /// Takes whatever the producers have submitted since the last poll and chains it after the jobs still pending, without
-    /// waiting. Lets a consumer that is busy with a batch pick up new arrivals early; order stays FIFO per producer.
-    /// Returns true if new jobs were found.
-    pub fn collect(&mut self) -> bool {
-        self.poll()
-    }
-
     /// The next job's value if one is ready.
     #[inline]
     pub fn try_recv(&mut self) -> Option<T> {
-        // BRANCH: take from the current chain first, then poll the outboxes once
+        // BRANCH: take from the current chain first, then look for the next sender with jobs
         if let Some(value) = self.pop() {
             return Some(value);
         }
-        self.poll();
+        // BRANCH: a lap found nothing
+        if !self.poll() {
+            return None;
+        }
         self.pop()
     }
 
@@ -1304,8 +1378,11 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             }
             // BRANCH: no senders left; the poll below sees everything they pushed before dropping
             if self.shared.senders.load(Ordering::Acquire) == 0 {
-                self.poll();
-                return self.pop().ok_or(GkTreiberChannelError::DISCONNECTED);
+                // BRANCH: one more lap; a job means more may follow, so go round again
+                if self.poll() {
+                    continue;
+                }
+                return Err(GkTreiberChannelError::DISCONNECTED);
             }
             // Spin first: a producer that is about to send is answered without the cost of a sleep and a wakeup.
             // BRANCH: one look per iteration; `Backoff::spin` waits longer after each look (up to 64 spin hints)
@@ -1337,7 +1414,8 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 self.retract();
                 continue;
             }
-            let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let timeout =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             // Safety: the waker lives as long as the shared state; only this receiver changes it, and it is not
             // changing it now. A producer may be calling `unpark` on it at the same time, which `&self` allows.
             unsafe { (*waker).park(timeout) };
@@ -1388,8 +1466,11 @@ impl<T: Send, W: GkAsyncWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             }
             // BRANCH: no senders left
             if self.shared.senders.load(Ordering::Acquire) == 0 {
-                self.poll();
-                return Poll::Ready(self.pop().ok_or(GkTreiberChannelError::DISCONNECTED));
+                // BRANCH: one more lap; a job means more may follow, so go round again
+                if self.poll() {
+                    continue;
+                }
+                return Poll::Ready(Err(GkTreiberChannelError::DISCONNECTED));
             }
             // Register the task, publish, look once more: a producer either sees the waker or we see its job.
             // BRANCH: jobs arrived while waiting for the waker to come back
@@ -1464,9 +1545,9 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
         };
         // Safety: the node is empty now and ours.
         unsafe { self.recycle(node) };
-        // BRANCH: the chain ran out: `tail` must not point at the node that left, and no node may wait idle
+        self.chain_len += 1;
+        // BRANCH: the chain ran out: no node may wait idle
         if self.head.is_null() {
-            self.tail = ptr::null_mut();
             self.flush_returns();
         }
         Some(value)
@@ -1474,22 +1555,33 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
 
     /// Adds an empty node to the return batch; sends the batch home first if the node goes elsewhere or it is full.
     ///
+    /// The batch reuses the chain's own links: nodes are consumed in chain order, so the batch's last node already
+    /// points at the next one and nothing is written. Only where one chain ends and the next begins is a link stored.
+    /// The receiver thus does not write to the nodes it reads, which matters when it trails right behind a producer:
+    /// the newest nodes share cache lines with the node the producer is filling.
+    ///
     /// # Safety
-    /// `node` must be valid, owned by the receiver and empty.
+    /// `node` must be valid, owned by the receiver and empty, and `pop` must already have read its `next`.
     #[inline(always)]
     unsafe fn recycle(&mut self, node: *mut GkJobNode<T, M>) {
         // Safety: forwarded from this function's contract.
         let channel = unsafe { (*node).channel() };
-        // BRANCH: same producer is the common case (a poll groups each producer's jobs)
+        // BRANCH: same producer is the common case (a chain is one producer's jobs)
         if channel == self.returns.channel {
-            // Safety: the node is ours; it becomes the batch's newest.
-            unsafe { (*node).next.store(self.returns.first, Ordering::Relaxed) };
+            // Safety: the batch's last node is ours; its `next` was read by `pop` and is not changed by anyone else.
+            unsafe {
+                let last = &(*self.returns.last).next;
+                // BRANCH: a new chain of the same producer; link it on (inside a chain the link is already there)
+                if last.load(Ordering::Relaxed) != node {
+                    last.store(node, Ordering::Relaxed);
+                }
+            }
         } else {
             self.flush_returns();
             self.returns.channel = channel;
-            self.returns.last = node;
+            self.returns.first = node;
         }
-        self.returns.first = node;
+        self.returns.last = node;
         self.returns.count += 1;
         // BRANCH: a full batch goes home at once
         if self.returns.count >= self.return_batch {
@@ -1510,19 +1602,45 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
         self.returns = GkReturnBatch::EMPTY;
     }
 
-    /// Takes every outbox with one swap each, reverses each chain (FIFO per producer), links them and appends the result
-    /// after the jobs still pending. Releases the thread channels whose owner is gone. Returns true if it found new jobs.
+    /// Makes the next sender's jobs the current chain, one sender per call, in laps over the senders. Called only when
+    /// the current chain is empty. Takes one outbox with one swap (an empty one costs a load), reverses it unless
+    /// `lifo` (FIFO per producer), and moves on to the next sender. At the end of the list it starts a new lap and picks
+    /// up newly registered senders. Returns false only after a whole lap, done within this call, found nothing, so a
+    /// false is a full look at every outbox (the parking handshake relies on it). Releases the thread channels whose
+    /// owner is gone.
     fn poll(&mut self) -> bool {
-        // BRANCH: a single-producer channel stops looking at the registry once it has its one sender
-        if !(self.single && !self.channels.is_null()) {
-            self.absorb_registry();
+        debug_assert!(self.head.is_null());
+        // BRANCH: lifo paces itself: a short chain means the receiver is caught up and would take tiny chains in
+        // lock-step with a producer (each take moves the outbox line between cores); wait a little, growing up to
+        // `Backoff`'s spin limit, so the producers get ahead. A long chain or an idle lap resets the wait.
+        if self.lifo {
+            let len = core::mem::take(&mut self.chain_len);
+            if len == 0 || len >= GK_LIFO_SHORT_CHAIN {
+                self.pace.reset();
+            } else {
+                self.pace.spin();
+            }
         }
-        let mut first_new: *mut GkJobNode<T, M> = ptr::null_mut();
-        let mut last_new: *mut GkJobNode<T, M> = ptr::null_mut();
-        let mut prev: *mut GkThreadChannel<T, M> = ptr::null_mut();
-        let mut channel = self.channels;
-        // BRANCH: one pass over the registered thread channels
-        while !channel.is_null() {
+        let mut lapped = false;
+        loop {
+            // BRANCH: end of the list; start a new lap, or stop after one whole lap found nothing
+            if self.cursor.is_null() {
+                if lapped {
+                    return false;
+                }
+                lapped = true;
+                // BRANCH: a single-producer channel stops looking at the registry once it has its one sender
+                if !(self.single && !self.channels.is_null()) {
+                    self.absorb_registry();
+                }
+                self.cursor = self.channels;
+                self.cursor_prev = ptr::null_mut();
+                // BRANCH: no senders at all
+                if self.cursor.is_null() {
+                    return false;
+                }
+            }
+            let channel = self.cursor;
             // Safety: registered channels are valid until their registration is released below.
             let (next, taken, retired) = unsafe {
                 let next = (*channel).registry_next.load(Ordering::Relaxed);
@@ -1537,45 +1655,35 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 }
                 (next, taken, retired)
             };
-            // BRANCH: this channel had jobs; append them after the previous ones
-            if !taken.is_null() {
-                let (first, last, _count) = GkJobNode::reverse_in_place(taken);
-                if last_new.is_null() {
-                    first_new = first;
-                } else {
-                    // Safety: both chains are owned by this thread now.
-                    unsafe { (*last_new).next.store(first, Ordering::Relaxed) };
-                }
-                last_new = last;
-            }
             if retired {
                 // BRANCH: unlink the channel from the private list
-                if prev.is_null() {
+                if self.cursor_prev.is_null() {
                     self.channels = next;
                 } else {
-                    // Safety: `prev` is registered and owned by this list.
-                    unsafe { (*prev).registry_next.store(next, Ordering::Relaxed) };
+                    // Safety: `cursor_prev` is registered and owned by this list.
+                    unsafe {
+                        (*self.cursor_prev)
+                            .registry_next
+                            .store(next, Ordering::Relaxed)
+                    };
                 }
                 // Safety: released once; the jobs just taken keep the channel alive through `pending`.
                 unsafe { release(channel, 1) };
             } else {
-                prev = channel;
+                self.cursor_prev = channel;
             }
-            channel = next;
+            self.cursor = next;
+            // BRANCH: this sender had jobs; they become the current chain
+            if !taken.is_null() {
+                // BRANCH: lifo hands the chain out as it is (newest first); otherwise reverse it to oldest first
+                self.head = if self.lifo {
+                    taken
+                } else {
+                    GkJobNode::reverse_in_place(taken).0
+                };
+                return true;
+            }
         }
-        // BRANCH: nothing new
-        if first_new.is_null() {
-            return false;
-        }
-        // BRANCH: chain after the pending jobs, or start the chain
-        if self.tail.is_null() {
-            self.head = first_new;
-        } else {
-            // Safety: the pending chain is owned by this receiver.
-            unsafe { (*self.tail).next.store(first_new, Ordering::Relaxed) };
-        }
-        self.tail = last_new;
-        true
     }
 
     /// Moves newly registered thread channels to the front of the private list.
@@ -1597,7 +1705,9 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 }
                 last = next;
             }
-            (*last).registry_next.store(self.channels, Ordering::Relaxed);
+            (*last)
+                .registry_next
+                .store(self.channels, Ordering::Relaxed);
         }
         self.channels = fresh;
     }
