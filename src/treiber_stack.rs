@@ -116,6 +116,8 @@ impl<T: TreiberNode> GkTreiberPtr<T> for AtomicPtr<T> {
         self.push_chain(item_ptr, item_ptr);
     }
 
+    // Safe by design (see the trait docs): the caller vouches for the pointers, like `push_to_stack`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn push_chain(&self, first: *mut T, last: *mut T) {
         // A push that succeeds first time never calls the backoff. `spin` (not
         // `snooze`) so a lock-free push never yields its time slice to the OS.
