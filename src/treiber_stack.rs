@@ -290,6 +290,21 @@ impl<N: TreiberNode> TreiberStackIterator<N> {
     pub unsafe fn from_head(head: *mut N) -> Self {
         Self { curr: head }
     }
+
+    /// The node the next call to `next` would yield, without taking it.
+    pub fn peek(&self) -> Option<core::ptr::NonNull<N>> {
+        core::ptr::NonNull::new(self.curr)
+    }
+
+    /// Stops iterating and hands back the nodes not yet yielded, still linked, oldest (next to yield) first. Null if
+    /// none are left. Nothing is freed: the caller owns the chain again.
+    ///
+    /// For a consumer with a budget: take up to `n` nodes, then keep the rest for its next turn (and resume it later
+    /// with [`from_head`](Self::from_head)) instead of freeing them on drop.
+    pub fn into_remaining(self) -> *mut N {
+        let me = core::mem::ManuallyDrop::new(self);
+        me.curr
+    }
 }
 
 impl<N: TreiberNode> Iterator for TreiberStackIterator<N> {
@@ -402,6 +417,12 @@ impl<N: TreiberNode> TreiberQueue<N> {
     ///   overwritten and the chain gets corrupted;
     /// - the node is freed or modified while it is still in the queue.
     pub fn push(&self, item_ptr: *mut N) -> bool {
+        // A full queue refuses with one shared load: a burst of refused
+        // pushes does not bounce the counter's line with two read-modify-writes
+        // each.
+        if self.count.load(Ordering::Relaxed) >= self.limit {
+            return false;
+        }
         // One fetch_add that cannot fail, instead of a CAS retry loop. The
         // limit is approximate anyway. Relaxed is enough: the count publishes
         // no data, the Release CAS in `push_to_stack` does.

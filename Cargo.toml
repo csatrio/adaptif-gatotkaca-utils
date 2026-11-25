@@ -1,9 +1,9 @@
 [package]
 name = "adaptif-gatotkaca-utils"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Low-level building blocks used by the adaptif-gatotkaca transport system: a no-hash u64 map, intrusive ref-counted pointers, a lock-free Treiber stack, a many-producer single-consumer channel built on it, and a many-producer many-consumer job queue for thread pools."
+description = "Low-level building blocks used by the adaptif-gatotkaca transport system: a no-hash u64 map, intrusive ref-counted pointers, a lock-free Treiber stack, a many-producer single-consumer channel built on it, Treiber stacks that tell producers when the consumer sleeps, and a many-producer many-consumer job queue for thread pools."
 license = "MIT OR Apache-2.0"
 homepage = "https://adaptif.co.id/"
 repository = "https://github.com/csatrio/adaptif-gatotkaca-utils"
@@ -11,7 +11,7 @@ documentation = "https://docs.rs/adaptif-gatotkaca-utils"
 readme = "README.md"
 keywords = ["lock-free", "treiber", "refcount", "hashmap", "atomic"]
 categories = ["data-structures", "concurrency"]
-include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "AGENTS.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 crossbeam-utils = "0.8"
@@ -22,6 +22,15 @@ criterion = { version = "0.5", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[target.'cfg(gk_loom)'.dependencies]
+# Only with `--cfg gk_loom` (the loom models); never pulled in otherwise.
+loom = "0.7"
+
+[lints.rust]
+# `--cfg gk_loom` runs the loom models (tests/loom_parking.rs). A crate-specific name, so dependencies (tokio)
+# do not switch to their own `cfg(loom)` code paths.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(gk_loom)"] }
 
 [[bench]]
 name = "treiber"

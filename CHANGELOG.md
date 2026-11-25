@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.0
+
+- `AGENTS.md`, shipped in the package: a guide for coding agents using the crate (which type to pick, recipes,
+  the parking-consumer loop, safety rules, progress guarantees, how to test an integration with Miri and loom). Its
+  examples run as doctests.
+- Added `GkParkingStack`, a many-producer single-consumer Treiber stack whose head also records whether the consumer
+  is asleep (`PARKED`, null, or the newest node). `push`/`push_chain` (one compare-and-swap, `AcqRel`) return `true`
+  only when they replaced `PARKED`, so producers wake the consumer once per sleep instead of once per push, and not at
+  all while it is draining. `reap` takes everything with one `Acquire` swap; `try_park` (null to `PARKED`, `Release`)
+  puts the consumer to sleep or fails if nodes arrived. The stack starts parked and frees leftover nodes with
+  `TreiberNode::drop_node` on drop. `PARKED` is the address of a private static, never a tag on node pointers.
+- Added `GkParkingQueue`, the same stack with a limit: `try_push` returns `Err(GkQueueFull)` and leaves the node with
+  the caller when full. The count is of nodes admitted and not yet released (`release(n)`), so the limit is exact
+  across reaps.
+- `TreiberStackIterator::peek` and `TreiberStackIterator::into_remaining`: stop part-way through a chain and keep the
+  rest (nothing is freed), for consumers that process a budget of nodes per turn.
+- `TreiberQueue::push` checks the count with one load before its `fetch_add`: a full queue now refuses without two
+  read-modify-writes on the counter's cache line.
+- Loom models of the parking protocol (`tests/loom_parking.rs`, run with `RUSTFLAGS="--cfg gk_loom"`), including a
+  deliberately wrong consumer (clears its signal after parking) that loom must report as a deadlock. `loom` is a
+  dependency only under `cfg(gk_loom)`, a crate-specific cfg so dependencies keep their normal builds.
+
 ## 0.15.0
 
 - Added `GkTreiberMpmc`, a many-producer many-consumer job queue for thread pools fed by a few runtime threads. Each

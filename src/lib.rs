@@ -11,6 +11,8 @@
 //! - [`fast_hashmap`]: [`FastU64Map`], a `HashMap` keyed by `u64` that skips hashing.
 //! - [`refcounted`]: [`GkRefCounted`], an `Arc`-like pointer with an intrusive reference count.
 //! - [`treiber_stack`]: lock-free Treiber stack helpers and a bounded [`TreiberQueue`].
+//! - [`treiber_parking`]: [`GkParkingStack`] and the bounded [`GkParkingQueue`], Treiber stacks whose head also says
+//!   whether the consumer is asleep, so a producer wakes it once per sleep instead of once per push.
 //! - [`treiber_channel::channel_waker`]: [`GkWaker`], how a channel's receiver sleeps and is woken (std threads by default, async
 //!   tasks through [`GkTaskWaker`], or your own thread pool or runtime).
 //! - [`treiber_channel::channel_memory`]: [`GkChannelMemory`], where a channel allocates (the heap by default, or a region you map
@@ -31,6 +33,7 @@ pub use nohash_hasher;
 pub mod fast_hashmap;
 pub mod refcounted;
 pub mod treiber_channel;
+pub mod treiber_parking;
 pub mod treiber_stack;
 
 pub use fast_hashmap::{FastU64Map, SqliteFastU64Map};
@@ -44,9 +47,15 @@ pub use treiber_channel::{
     GK_GROW_NODES, GK_LIFO_SHORT_CHAIN, GK_RETURN_BATCH, GK_SLAB_NODES, GK_SPIN_POLLS, GkReceiver, GkRecvFuture, GkSender,
     GkTreiberChannel, GkTreiberChannelConfig, GkTreiberChannelError, GkTrySendError,
 };
+pub use treiber_parking::{GkParkingQueue, GkParkingStack, GkQueueFull};
 pub use treiber_stack::{GkTreiberPtr, GkTreiberStackIterator, TreiberNode, TreiberQueue, TreiberStackIterator};
 
 // Compile and run the README examples as part of `cargo test`.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+// Compile and run the AGENTS.md examples too: coding agents copy them.
+#[cfg(doctest)]
+#[doc = include_str!("../AGENTS.md")]
+struct AgentsDoctests;

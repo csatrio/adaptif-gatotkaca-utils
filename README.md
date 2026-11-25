@@ -11,13 +11,14 @@ developed by [PT Adaptif Sinergi Dinamis](https://adaptif.co.id/).
 | `fast_hashmap` | `FastU64Map<V>`: a `HashMap<u64, V>` that uses the key as its own hash (no SipHash). |
 | `refcounted` | `GkRefCounted<T>`: an `Arc`-like pointer whose reference count lives inside `T` (`GkIntrinsicRefCounted`). |
 | `treiber_stack` | Lock-free Treiber stack helpers on `AtomicPtr`, FIFO/LIFO iterators, and a bounded `TreiberQueue`. |
+| `treiber_parking` | `GkParkingStack` / bounded `GkParkingQueue`: Treiber stacks that tell producers when the single consumer is asleep, so it is woken once per sleep. |
 | `treiber_channel` | `GkTreiberChannel`: a many-producer, one-consumer channel. `GkTreiberMpmc`: a many-producer, many-consumer job queue for thread pools. |
 
 ## Installation
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-utils = "0.15"
+adaptif-gatotkaca-utils = "0.16"
 ```
 
 The crate re-exports its dependencies, `crossbeam_utils` and `nohash_hasher`,
@@ -378,6 +379,112 @@ let newest_first: Vec<u64> = stack
     .collect();
 assert_eq!(newest_first, [3, 2, 1]);
 assert!(stack.is_empty());
+```
+
+## GkParkingStack and GkParkingQueue
+
+A Treiber stack whose head also records whether the single consumer is asleep, so producers wake it **once per
+sleep** instead of once per push. Built for event-loop consumers woken through an eventfd or a semaphore: while the
+consumer is busy draining, pushes cost one compare-and-swap and no system call.
+
+The head is `PARKED` (consumer asleep), null (consumer awake, nothing queued) or the newest node.
+
+- `push` (one compare-and-swap) returns `true` when it replaced `PARKED`: the caller must wake the consumer.
+- `reap` takes every queued node with one swap, newest first. Afterwards the consumer counts as awake.
+- `try_park` (null to `PARKED`) puts the consumer to sleep, or fails if nodes arrived since the last reap.
+
+The stack starts parked. A consumer with a level-triggered signal (eventfd, semaphore count) must **clear the signal
+before `try_park`**, never after: clearing after a successful park can swallow a wake-up.
+
+```rust
+use adaptif_gatotkaca_utils::{GkParkingStack, TreiberNode, TreiberStackIterator};
+use std::ptr::{self, NonNull};
+use std::sync::atomic::AtomicPtr;
+
+struct Job {
+    next: AtomicPtr<Job>,
+    id: u32,
+}
+
+impl TreiberNode for Job {
+    type Value = u32;
+    fn next(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
+    fn value(&self) -> &u32 {
+        &self.id
+    }
+}
+
+let stack = GkParkingStack::<Job>::new();
+let job = |id| NonNull::from(Box::leak(Box::new(Job { next: AtomicPtr::new(ptr::null_mut()), id })));
+
+// Producers. Safety: each job is ours and in no stack.
+assert!(unsafe { stack.push(job(1)) }, "the consumer starts parked: wake it");
+assert!(!unsafe { stack.push(job(2)) }, "a wake-up is already on its way");
+
+// Consumer: drain in push order.
+let head = stack.reap().unwrap();
+let (oldest, _, _) = Job::reverse_in_place(head.as_ptr());
+let ids: Vec<u32> = unsafe { TreiberStackIterator::from_head(oldest) }
+    .map(|j| unsafe { Box::from_raw(j) }.id)
+    .collect();
+assert_eq!(ids, [1, 2]);
+
+// Nothing left: clear the wake-up signal, then park.
+assert!(stack.reap().is_none());
+assert!(stack.try_park());
+assert!(unsafe { stack.push(job(3)) }, "parked again: the next push wakes it");
+# drop(stack); // frees job 3 with `TreiberNode::drop_node`
+```
+
+`GkParkingQueue` adds a limit for work that may be refused (an HTTP server answering 503), with the
+`TreiberQueue` admission counter. `try_push` returns `Err(GkQueueFull)` and leaves the node with the caller when full.
+The count is of nodes admitted and not yet released: the consumer calls `release(n)` when it is done with them, so
+the limit stays exact across reaps.
+
+```rust
+use adaptif_gatotkaca_utils::{GkParkingQueue, GkQueueFull, TreiberNode};
+use std::ptr::{self, NonNull};
+use std::sync::atomic::AtomicPtr;
+
+struct Req {
+    next: AtomicPtr<Req>,
+}
+
+impl TreiberNode for Req {
+    type Value = ();
+    fn next(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
+    fn value(&self) -> &() {
+        &()
+    }
+}
+
+let q = GkParkingQueue::<Req>::new(1);
+let req = || NonNull::from(Box::leak(Box::new(Req { next: AtomicPtr::new(ptr::null_mut()) })));
+
+assert_eq!(unsafe { q.try_push(req()) }, Ok(true));
+let refused = req();
+assert_eq!(unsafe { q.try_push(refused) }, Err(GkQueueFull)); // still ours
+drop(unsafe { Box::from_raw(refused.as_ptr()) });
+
+let head = q.reap().unwrap();
+drop(unsafe { Box::from_raw(head.as_ptr()) });
+q.release(1);
+assert!(q.is_empty());
+```
+
+`TreiberStackIterator::into_remaining` lets a consumer with a budget stop after `n` nodes and keep the rest of the
+chain for its next turn (resume with `TreiberStackIterator::from_head`).
+
+The protocol is checked by loom models (`tests/loom_parking.rs`), including a deliberately wrong consumer that clears
+its signal after parking, which loom must report as a deadlock:
+
+```sh
+RUSTFLAGS="--cfg gk_loom" cargo test --release --test loom_parking
+cargo +nightly miri test --test treiber_parking
 ```
 
 ## GkTreiberChannel
