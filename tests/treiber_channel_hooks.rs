@@ -4,8 +4,8 @@
 // ==== Import Definition ====
 
 use adaptif_gatotkaca_utils::{
-    GkChannelMemory, GkHeapMemory, GkRegionError, GkRegionMemory, GkTaskWaker, GkThreadWaker,
-    GkTreiberChannel, GkTreiberChannelConfig, GkTreiberChannelError, GkTrySendError, GkWaker,
+    GkChannelMemory, GkHeapMemory, GkRegionError, GkRegionMemory, GkTaskWaker, GkThreadWaker, GkTreiberChannel, GkTreiberChannelConfig,
+    GkTreiberChannelError, GkTrySendError, GkWaker,
 };
 
 use std::{
@@ -30,23 +30,15 @@ fn within<R: Send + 'static>(seconds: u64, f: impl FnOnce() -> R + Send + 'stati
     thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(Duration::from_secs(seconds))
-        .expect("test timed out")
+    rx.recv_timeout(Duration::from_secs(seconds)).expect("test timed out")
 }
 
 fn small(slab: usize) -> GkTreiberChannelConfig {
-    GkTreiberChannelConfig::DEFAULT
-        .with_slab_nodes(slab)
-        .with_grow_nodes(slab)
-        .with_return_batch(8)
+    GkTreiberChannelConfig::DEFAULT.with_slab_nodes(slab).with_grow_nodes(slab).with_return_batch(8)
 }
 
 /// Producers send `per` values each; the receiver (any waker) checks per-producer order and the count.
-fn run_traffic<W: GkWaker + Default, M: GkChannelMemory>(
-    channel: &GkTreiberChannel<u64, W, M>,
-    producers: u64,
-    per: u64,
-) {
+fn run_traffic<W: GkWaker + Default, M: GkChannelMemory>(channel: &GkTreiberChannel<u64, W, M>, producers: u64, per: u64) {
     let mut receiver = channel.receiver().unwrap();
     let handles: Vec<_> = (0..producers)
         .map(|id| {
@@ -89,10 +81,7 @@ impl GkWaker for PoolWaker {
         let mut woken = lock.lock().unwrap();
         // BRANCH: an unpark that came first is consumed at once
         if !*woken {
-            woken = condvar
-                .wait_timeout(woken, timeout.unwrap_or(Duration::from_secs(5)))
-                .unwrap()
-                .0;
+            woken = condvar.wait_timeout(woken, timeout.unwrap_or(Duration::from_secs(5))).unwrap().0;
         }
         *woken = false;
     }
@@ -139,11 +128,7 @@ fn a_custom_waker_carries_heavy_traffic() {
 #[test]
 fn async_receive_on_tokio() {
     within(30, || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_time()
-            .build()
-            .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_time().build().unwrap();
         runtime.block_on(async {
             let channel = GkTreiberChannel::<u64, GkTaskWaker>::with_config(small(16)).unwrap();
             let mut receiver = channel.receiver().unwrap();
@@ -213,10 +198,7 @@ fn async_receive_without_a_runtime() {
         });
         assert_eq!(block_on(receiver.recv_async()).unwrap(), 11);
         drop(producer.join().unwrap());
-        assert_eq!(
-            block_on(receiver.recv_async()).unwrap_err(),
-            GkTreiberChannelError::DISCONNECTED
-        );
+        assert_eq!(block_on(receiver.recv_async()).unwrap_err(), GkTreiberChannelError::DISCONNECTED);
     });
 }
 
@@ -248,10 +230,7 @@ struct Counted {
 
 impl Counted {
     fn new() -> Self {
-        Self {
-            live: Arc::new(AtomicIsize::new(0)),
-            calls: Arc::new(AtomicUsize::new(0)),
-        }
+        Self { live: Arc::new(AtomicIsize::new(0)), calls: Arc::new(AtomicUsize::new(0)) }
     }
 }
 
@@ -259,14 +238,12 @@ impl Counted {
 unsafe impl GkChannelMemory for Counted {
     fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.live
-            .fetch_add(layout.size() as isize, Ordering::SeqCst);
+        self.live.fetch_add(layout.size() as isize, Ordering::SeqCst);
         GkHeapMemory.allocate(layout)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        self.live
-            .fetch_sub(layout.size() as isize, Ordering::SeqCst);
+        self.live.fetch_sub(layout.size() as isize, Ordering::SeqCst);
         unsafe { GkHeapMemory.deallocate(ptr, layout) }
     }
 }
@@ -289,8 +266,7 @@ impl Mapping {
 #[test]
 fn every_allocation_goes_through_the_memory_hook() {
     let memory = Counted::new();
-    let channel =
-        GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(16), memory.clone()).unwrap();
+    let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(16), memory.clone()).unwrap();
     run_traffic(&channel, 4, 2_000);
     assert!(memory.calls.load(Ordering::SeqCst) > 4);
     drop(channel);
@@ -304,9 +280,7 @@ fn many_channels_share_one_region_and_give_it_back() {
     let region = mapping.region();
     let config = small(32);
     // BRANCH: a large number of channels live in the region at once
-    let channels: Vec<_> = (0..200)
-        .map(|_| GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config, region).unwrap())
-        .collect();
+    let channels: Vec<_> = (0..200).map(|_| GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config, region).unwrap()).collect();
     for channel in channels.iter().step_by(20) {
         run_traffic(channel, 2, 500);
     }
@@ -314,8 +288,7 @@ fn many_channels_share_one_region_and_give_it_back() {
     assert_eq!(region.in_use(), 0);
     // Freed blocks are reused: a second round fits in the same region.
     for _ in 0..3 {
-        let channel =
-            GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config, region).unwrap();
+        let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config, region).unwrap();
         run_traffic(&channel, 3, 1_000);
     }
     assert_eq!(region.in_use(), 0);
@@ -325,16 +298,12 @@ fn many_channels_share_one_region_and_give_it_back() {
 fn a_full_region_reports_out_of_memory_without_leaking() {
     let mut mapping = Mapping::new(GkRegionMemory::HEADER_LEN + 64);
     let region = mapping.region();
-    assert_eq!(
-        GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(4), region).err(),
-        Some(GkTreiberChannelError::OUT_OF_MEMORY)
-    );
+    assert_eq!(GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(4), region).err(), Some(GkTreiberChannelError::OUT_OF_MEMORY));
     assert_eq!(region.in_use(), 0);
 
     let mut mapping = Mapping::new(64 * 1024);
     let region = mapping.region();
-    let channel =
-        GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(512), region).unwrap();
+    let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(small(512), region).unwrap();
     let mut receiver = channel.receiver().unwrap();
     let mut senders = Vec::new();
     // BRANCH: senders until the region is full; the failing one leaves nothing behind
@@ -371,15 +340,9 @@ fn region_set_up_errors() {
     let mut mapping = Mapping::new(4096);
     let base = NonNull::new(mapping.0.as_mut_ptr().cast::<u8>()).unwrap();
     // Safety (both calls): refused before the memory is touched.
-    assert_eq!(
-        unsafe { GkRegionMemory::new(base, GkRegionMemory::HEADER_LEN - 1) }.err(),
-        Some(GkRegionError::TooSmall)
-    );
+    assert_eq!(unsafe { GkRegionMemory::new(base, GkRegionMemory::HEADER_LEN - 1) }.err(), Some(GkRegionError::TooSmall));
     let odd = NonNull::new(base.as_ptr().wrapping_add(1)).unwrap();
-    assert_eq!(
-        unsafe { GkRegionMemory::new(odd, 1024) }.err(),
-        Some(GkRegionError::Misaligned)
-    );
+    assert_eq!(unsafe { GkRegionMemory::new(odd, 1024) }.err(), Some(GkRegionError::Misaligned));
 }
 
 // ==== Single producer ====
@@ -391,10 +354,7 @@ fn single_producer_has_one_sender_and_keeps_order() {
         let channel = GkTreiberChannel::<u64>::with_config(config).unwrap();
         let mut receiver = channel.receiver().unwrap();
         let mut sender = channel.sender().unwrap();
-        assert_eq!(
-            channel.sender().err(),
-            Some(GkTreiberChannelError::SENDER_TAKEN)
-        );
+        assert_eq!(channel.sender().err(), Some(GkTreiberChannelError::SENDER_TAKEN));
         let producer = thread::spawn(move || {
             for i in 0..200_000u64 {
                 sender.send(i).unwrap();
@@ -404,30 +364,19 @@ fn single_producer_has_one_sender_and_keeps_order() {
             assert_eq!(receiver.recv().unwrap(), i);
         }
         producer.join().unwrap();
-        assert_eq!(
-            receiver.recv().unwrap_err(),
-            GkTreiberChannelError::DISCONNECTED
-        );
+        assert_eq!(receiver.recv().unwrap_err(), GkTreiberChannelError::DISCONNECTED);
         // The one sender is gone for good.
-        assert_eq!(
-            channel.sender().err(),
-            Some(GkTreiberChannelError::SENDER_TAKEN)
-        );
+        assert_eq!(channel.sender().err(), Some(GkTreiberChannelError::SENDER_TAKEN));
     });
 }
 
 #[test]
 fn single_producer_ping_pong() {
     within(30, || {
-        let config = GkTreiberChannelConfig::DEFAULT
-            .with_single_producer(true)
-            .with_slab_nodes(16);
-        let (request, reply) = (
-            GkTreiberChannel::<u64>::with_config(config).unwrap(),
-            GkTreiberChannel::<u64>::with_config(config).unwrap(),
-        );
-        let (mut request_tx, mut request_rx) =
-            (request.sender().unwrap(), request.receiver().unwrap());
+        let config = GkTreiberChannelConfig::DEFAULT.with_single_producer(true).with_slab_nodes(16);
+        let (request, reply) =
+            (GkTreiberChannel::<u64>::with_config(config).unwrap(), GkTreiberChannel::<u64>::with_config(config).unwrap());
+        let (mut request_tx, mut request_rx) = (request.sender().unwrap(), request.receiver().unwrap());
         let (mut reply_tx, mut reply_rx) = (reply.sender().unwrap(), reply.receiver().unwrap());
         let server = thread::spawn(move || {
             while let Ok(value) = request_rx.recv() {
@@ -451,11 +400,7 @@ fn small_hooks_under_contention() {
     let config = small(4).with_return_batch(3).with_spin_polls(2);
     // BRANCH: unbounded and bounded in a region, then a single-producer channel on the heap
     for bounded in [false, true] {
-        let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(
-            config.with_bounded(bounded),
-            region,
-        )
-        .unwrap();
+        let channel = GkTreiberChannel::<u64, GkThreadWaker, _>::with_memory(config.with_bounded(bounded), region).unwrap();
         run_traffic(&channel, 3, 20);
         drop(channel);
         assert_eq!(region.in_use(), 0);

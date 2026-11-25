@@ -275,12 +275,7 @@ mod tests {
 
     fn make(custom: bool) -> (*mut Obj, Arc<Mutex<Vec<&'static str>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let raw = Box::into_raw(Box::new(Obj {
-            ref_count: AtomicU32::new(0),
-            value: 1,
-            log: log.clone(),
-            custom_release: custom,
-        }));
+        let raw = Box::into_raw(Box::new(Obj { ref_count: AtomicU32::new(0), value: 1, log: log.clone(), custom_release: custom }));
         (raw, log)
     }
 

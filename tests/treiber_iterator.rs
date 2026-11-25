@@ -20,10 +20,7 @@ impl TreiberNode for Node {
 }
 
 fn node(id: u32) -> *mut Node {
-    Box::into_raw(Box::new(Node {
-        next: AtomicPtr::new(ptr::null_mut()),
-        id,
-    }))
+    Box::into_raw(Box::new(Node { next: AtomicPtr::new(ptr::null_mut()), id }))
 }
 
 fn stack_of(n: u32) -> AtomicPtr<Node> {
@@ -89,9 +86,7 @@ impl TreiberNode for Counted {
 fn drop_mid_iteration_drops_each_unyielded_node_once() {
     let stack: AtomicPtr<Counted> = AtomicPtr::new(ptr::null_mut());
     for _ in 0..10 {
-        stack.push_to_stack(Box::into_raw(Box::new(Counted {
-            next: AtomicPtr::new(ptr::null_mut()),
-        })));
+        stack.push_to_stack(Box::into_raw(Box::new(Counted { next: AtomicPtr::new(ptr::null_mut()) })));
     }
 
     let mut it = stack.reap_all().iterator();

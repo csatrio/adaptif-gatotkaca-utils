@@ -382,11 +382,7 @@ pub struct TreiberQueue<N> {
 impl<N: TreiberNode> TreiberQueue<N> {
     /// Creates an empty queue that holds about `limit` items.
     pub fn new(limit: usize) -> Self {
-        Self {
-            head: CachePadded::new(<AtomicPtr<N> as GkTreiberPtr<N>>::new()),
-            count: CachePadded::new(AtomicUsize::new(0)),
-            limit,
-        }
+        Self { head: CachePadded::new(<AtomicPtr<N> as GkTreiberPtr<N>>::new()), count: CachePadded::new(AtomicUsize::new(0)), limit }
     }
 
     /// Pushes `item_ptr` onto the queue. Safe to call from many threads at once.

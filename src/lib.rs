@@ -35,22 +35,16 @@ pub mod treiber_stack;
 
 pub use fast_hashmap::{FastU64Map, SqliteFastU64Map};
 pub use refcounted::{GkIntrinsicRefCounted, GkRefCounted};
-pub use treiber_channel::channel_memory::{
-    GkChannelMemory, GkHeapMemory, GkRegionError, GkRegionMemory,
-};
+pub use treiber_channel::channel_memory::{GkChannelMemory, GkHeapMemory, GkRegionError, GkRegionMemory};
 pub use treiber_channel::channel_waker::{GkAsyncWaker, GkTaskWaker, GkThreadWaker, GkWaker};
 pub use treiber_channel::mpmc::{
-    GK_MPMC_MAX_CHAINS, GK_MPMC_MAX_LANES, GK_MPMC_RESCUE_AFTER, GkMpmcChain, GkMpmcLane,
-    GkTreiberMpmc, GkTreiberMpmcConfig,
+    GK_MPMC_MAX_CHAINS, GK_MPMC_MAX_LANES, GK_MPMC_RESCUE_AFTER, GkMpmcChain, GkMpmcLane, GkTreiberMpmc, GkTreiberMpmcConfig,
 };
 pub use treiber_channel::{
-    GK_GROW_NODES, GK_LIFO_SHORT_CHAIN, GK_RETURN_BATCH, GK_SLAB_NODES, GK_SPIN_POLLS, GkReceiver,
-    GkRecvFuture, GkSender, GkTreiberChannel, GkTreiberChannelConfig, GkTreiberChannelError,
-    GkTrySendError,
+    GK_GROW_NODES, GK_LIFO_SHORT_CHAIN, GK_RETURN_BATCH, GK_SLAB_NODES, GK_SPIN_POLLS, GkReceiver, GkRecvFuture, GkSender,
+    GkTreiberChannel, GkTreiberChannelConfig, GkTreiberChannelError, GkTrySendError,
 };
-pub use treiber_stack::{
-    GkTreiberPtr, GkTreiberStackIterator, TreiberNode, TreiberQueue, TreiberStackIterator,
-};
+pub use treiber_stack::{GkTreiberPtr, GkTreiberStackIterator, TreiberNode, TreiberQueue, TreiberStackIterator};
 
 // Compile and run the README examples as part of `cargo test`.
 #[cfg(doctest)]

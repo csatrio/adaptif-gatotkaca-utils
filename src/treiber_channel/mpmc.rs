@@ -140,11 +140,7 @@ pub struct GkTreiberMpmcConfig {
 
 impl GkTreiberMpmcConfig {
     /// Every field at its `GK_MPMC_*` default.
-    pub const DEFAULT: Self = Self {
-        max_lanes: GK_MPMC_MAX_LANES,
-        max_chains: GK_MPMC_MAX_CHAINS,
-        rescue_after: GK_MPMC_RESCUE_AFTER,
-    };
+    pub const DEFAULT: Self = Self { max_lanes: GK_MPMC_MAX_LANES, max_chains: GK_MPMC_MAX_CHAINS, rescue_after: GK_MPMC_RESCUE_AFTER };
 
     /// Sets [`max_lanes`](Self::max_lanes).
     pub const fn with_max_lanes(mut self, max_lanes: usize) -> Self {
@@ -356,12 +352,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcShared<N, M> {
         loop {
             // Safety: the chain is ours until the CAS publishes it.
             unsafe { (*oldest).next().store(head, Ordering::Relaxed) };
-            match lane.pending.compare_exchange_weak(
-                head,
-                newest,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
+            match lane.pending.compare_exchange_weak(head, newest, Ordering::SeqCst, Ordering::Relaxed) {
                 // BRANCH: published
                 Ok(_) => return,
                 // BRANCH: the producer pushed or a worker reaped meanwhile; retry on the new head
@@ -383,15 +374,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcShared<N, M> {
             let slot = self.slot(index);
             // BRANCH: a free slot is ours if the CAS wins it; `held()` keeps others out while the generation changes
             if slot.head.load(Ordering::Relaxed).is_null()
-                && slot
-                    .head
-                    .compare_exchange(
-                        ptr::null_mut(),
-                        held(),
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
+                && slot.head.compare_exchange(ptr::null_mut(), held(), Ordering::Acquire, Ordering::Relaxed).is_ok()
             {
                 // Relaxed: only the holder of the slot writes it, and the Release below publishes it.
                 let generation = slot.generation.load(Ordering::Relaxed).wrapping_add(1);
@@ -415,13 +398,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcShared<N, M> {
     ///
     /// With `claim`, the chain gets a new generation: its previous taker stops at its next take, and the caller's chain
     /// carries on alone (a rescue takes a stalled chain over instead of sharing it).
-    fn take_from_slot(
-        &self,
-        index: usize,
-        patient: bool,
-        generation: Option<u64>,
-        claim: bool,
-    ) -> Option<(NonNull<N>, u64)> {
+    fn take_from_slot(&self, index: usize, patient: bool, generation: Option<u64>, claim: bool) -> Option<(NonNull<N>, u64)> {
         let slot = self.slot(index);
         let backoff = Backoff::new();
         loop {
@@ -442,11 +419,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcShared<N, M> {
             // Acquire pairs with the Release that put `head` here (a publish or the previous taker's store): the
             // chain's links are visible. Only now is the chain ours; nothing was read through `head` before.
             // BRANCH: lost to another worker (or a spurious failure); look again
-            if slot
-                .head
-                .compare_exchange_weak(head, held(), Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
+            if slot.head.compare_exchange_weak(head, held(), Ordering::Acquire, Ordering::Relaxed).is_err() {
                 continue;
             }
             // Relaxed: the publish (or a claim) wrote it before the Release we acquired, and nobody changes it while we
@@ -520,23 +493,13 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcShared<N, M> {
                 // BRANCH: a shared chain (not free, not mid-take)
                 if !head.is_null() && head != held() {
                     let generation = slot.generation.load(Ordering::Relaxed);
-                    let seen = GkSeen {
-                        slot: ptr::from_ref(slot).addr(),
-                        generation,
-                        head: head.addr(),
-                        since: Some(now),
-                    };
+                    let seen = GkSeen { slot: ptr::from_ref(slot).addr(), generation, head: head.addr(), since: Some(now) };
                     let entry = &mut rescue.seen[(seen.slot >> 7) % SEEN_ENTRIES];
                     // BRANCH: unchanged since this thread's earlier look, long enough ago: stalled
                     if entry.same_as(&seen) {
-                        if entry
-                            .since
-                            .is_some_and(|since| now.duration_since(since) >= delay)
-                        {
+                        if entry.since.is_some_and(|since| now.duration_since(since) >= delay) {
                             // BRANCH: still that chain (a take here moves its head, and the next look starts over)
-                            if let Some((job, generation)) =
-                                self.take_from_slot(index, false, Some(generation), true)
-                            {
+                            if let Some((job, generation)) = self.take_from_slot(index, false, Some(generation), true) {
                                 *entry = GkSeen::EMPTY;
                                 return Some((job, index, generation));
                             }
@@ -578,11 +541,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcShared<N, M> {
 fn table_layouts<N>(config: &GkTreiberMpmcConfig) -> Option<(Layout, Option<Layout>)> {
     let lanes = Layout::array::<CachePadded<GkLane<N>>>(config.max_lanes).ok()?;
     // BRANCH: no slots take no memory
-    let chains = if config.max_chains == 0 {
-        None
-    } else {
-        Some(Layout::array::<CachePadded<GkChainSlot<N>>>(config.max_chains).ok()?)
-    };
+    let chains = if config.max_chains == 0 { None } else { Some(Layout::array::<CachePadded<GkChainSlot<N>>>(config.max_chains).ok()?) };
     Some((lanes, chains))
 }
 
@@ -598,17 +557,14 @@ impl<N: TreiberNode, M: GkChannelMemory> Drop for GkMpmcShared<N, M> {
         for index in 0..self.config.max_chains {
             self.drain_slot(index, &mut free);
         }
-        let (lanes, chains) =
-            table_layouts::<N>(&self.config).expect("the layouts were valid when allocated");
+        let (lanes, chains) = table_layouts::<N>(&self.config).expect("the layouts were valid when allocated");
         // Safety: both blocks came from this memory with these layouts and nothing uses them any more. They hold
         // atomics only, so there is nothing to drop.
         unsafe {
-            self.memory
-                .deallocate(NonNull::new_unchecked(self.lanes.cast()), lanes);
+            self.memory.deallocate(NonNull::new_unchecked(self.lanes.cast()), lanes);
             // BRANCH: only allocated when there are slots
             if let Some(chains) = chains {
-                self.memory
-                    .deallocate(NonNull::new_unchecked(self.chains.cast()), chains);
+                self.memory.deallocate(NonNull::new_unchecked(self.chains.cast()), chains);
             }
         }
     }
@@ -681,20 +637,12 @@ struct GkSeen {
 }
 
 impl GkSeen {
-    const EMPTY: Self = Self {
-        slot: 0,
-        generation: 0,
-        head: 0,
-        since: None,
-    };
+    const EMPTY: Self = Self { slot: 0, generation: 0, head: 0, since: None };
 
     /// Same slot, same chain, same first job: nobody took a job from it in between.
     #[inline(always)]
     fn same_as(&self, other: &Self) -> bool {
-        self.since.is_some()
-            && self.slot == other.slot
-            && self.generation == other.generation
-            && self.head == other.head
+        self.since.is_some() && self.slot == other.slot && self.generation == other.generation && self.head == other.head
     }
 }
 
@@ -777,9 +725,7 @@ unsafe impl<N: TreiberNode + Send, M: GkChannelMemory> Sync for GkTreiberMpmc<N,
 
 impl<N: TreiberNode, M: GkChannelMemory> Clone for GkTreiberMpmc<N, M> {
     fn clone(&self) -> Self {
-        Self {
-            shared: self.shared.clone(),
-        }
+        Self { shared: self.shared.clone() }
     }
 }
 
@@ -802,8 +748,7 @@ impl<N: TreiberNode, M: GkChannelMemory + Default> Default for GkTreiberMpmc<N, 
 impl<N: TreiberNode, M: GkChannelMemory + Default> GkTreiberMpmc<N, M> {
     /// Creates a queue with the default configuration.
     pub fn new() -> Self {
-        Self::with_memory(GkTreiberMpmcConfig::DEFAULT, M::default())
-            .expect("default memory allocates")
+        Self::with_memory(GkTreiberMpmcConfig::DEFAULT, M::default()).expect("default memory allocates")
     }
 
     /// Creates a queue with `config`. Fails with `INVALID_CONFIG` (allocating nothing) if
@@ -816,33 +761,18 @@ impl<N: TreiberNode, M: GkChannelMemory + Default> GkTreiberMpmc<N, M> {
 impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
     /// Creates a queue whose lane table and chain slots come from `memory`. Fails with `INVALID_CONFIG` if `config` is
     /// rejected and with `OUT_OF_MEMORY` if `memory` has no room; neither error leaves anything allocated.
-    pub fn with_memory(
-        config: GkTreiberMpmcConfig,
-        memory: M,
-    ) -> Result<Self, GkTreiberChannelError> {
-        const {
-            assert!(
-                align_of::<N>() >= 2,
-                "a job must be aligned to at least 2 (it holds an AtomicPtr)"
-            )
-        };
+    pub fn with_memory(config: GkTreiberMpmcConfig, memory: M) -> Result<Self, GkTreiberChannelError> {
+        const { assert!(align_of::<N>() >= 2, "a job must be aligned to at least 2 (it holds an AtomicPtr)") };
         config.validate()?;
-        let (lanes_layout, chains_layout) =
-            table_layouts::<N>(&config).ok_or(GkTreiberChannelError::INVALID_CONFIG)?;
-        let lanes = memory
-            .allocate(lanes_layout)
-            .ok_or(GkTreiberChannelError::OUT_OF_MEMORY)?
-            .cast::<CachePadded<GkLane<N>>>()
-            .as_ptr();
+        let (lanes_layout, chains_layout) = table_layouts::<N>(&config).ok_or(GkTreiberChannelError::INVALID_CONFIG)?;
+        let lanes = memory.allocate(lanes_layout).ok_or(GkTreiberChannelError::OUT_OF_MEMORY)?.cast::<CachePadded<GkLane<N>>>().as_ptr();
         // BRANCH: slots only when sharing is on
         let chains = match chains_layout {
             None => NonNull::dangling().as_ptr(),
             Some(layout) => {
                 let Some(chains) = memory.allocate(layout) else {
                     // Safety: just allocated with this layout, holds nothing.
-                    unsafe {
-                        memory.deallocate(NonNull::new_unchecked(lanes.cast()), lanes_layout)
-                    };
+                    unsafe { memory.deallocate(NonNull::new_unchecked(lanes.cast()), lanes_layout) };
                     return Err(GkTreiberChannelError::OUT_OF_MEMORY);
                 };
                 chains.cast::<CachePadded<GkChainSlot<N>>>().as_ptr()
@@ -859,10 +789,9 @@ impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
                 }));
             }
             for slot in 0..config.max_chains {
-                chains.add(slot).write(CachePadded::new(GkChainSlot {
-                    head: AtomicPtr::new(ptr::null_mut()),
-                    generation: AtomicU64::new(0),
-                }));
+                chains
+                    .add(slot)
+                    .write(CachePadded::new(GkChainSlot { head: AtomicPtr::new(ptr::null_mut()), generation: AtomicU64::new(0) }));
             }
         }
         let shared = alloc_value(
@@ -882,9 +811,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
         };
         Ok(Self {
             // Safety: `alloc_value` never returns null.
-            shared: GkMpmcRef {
-                ptr: unsafe { NonNull::new_unchecked(shared) },
-            },
+            shared: GkMpmcRef { ptr: unsafe { NonNull::new_unchecked(shared) } },
         })
     }
 
@@ -905,11 +832,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
         for index in 0..shared.config.max_lanes {
             let lane = shared.lane(index);
             // BRANCH: skip held lanes with a load; claim a free one with a CAS
-            if lane.owned.load(Ordering::Relaxed)
-                || lane
-                    .owned
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
+            if lane.owned.load(Ordering::Relaxed) || lane.owned.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
             {
                 continue;
             }
@@ -917,13 +840,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
             shared.used.fetch_max(index + 1, Ordering::Release);
             // The Acquire claim pairs with the previous owner's Release: its last count is visible.
             let pushed = lane.pushed.load(Ordering::Relaxed);
-            return Ok(GkMpmcLane {
-                lane,
-                index,
-                pushed,
-                _shared: self.shared.clone(),
-                _not_sync: PhantomData,
-            });
+            return Ok(GkMpmcLane { lane, index, pushed, _shared: self.shared.clone(), _not_sync: PhantomData });
         }
         Err(GkTreiberChannelError::TOO_MANY_LANES)
     }
@@ -953,20 +870,12 @@ impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
                 (*head).next().store(ptr::null_mut(), Ordering::Relaxed);
                 rest
             };
-            let shared_at = if rest.is_null() {
-                None
-            } else {
-                shared.publish(rest, start)
-            };
+            let shared_at = if rest.is_null() { None } else { shared.publish(rest, start) };
             let (slot, generation) = shared_at.unwrap_or((NO_SLOT, 0));
             return Some(GkMpmcChain {
                 shared,
                 next: head,
-                private: if shared_at.is_none() {
-                    rest
-                } else {
-                    ptr::null_mut()
-                },
+                private: if shared_at.is_none() { rest } else { ptr::null_mut() },
                 slot,
                 generation,
                 lane,
@@ -995,9 +904,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkTreiberMpmc<N, M> {
     /// look for a stalled chain; at shutdown, [`drain`](Self::drain) takes them.
     pub fn shared_chains(&self) -> usize {
         let shared = &*self.shared;
-        (0..shared.config.max_chains)
-            .filter(|&index| !shared.slot(index).head.load(Ordering::Acquire).is_null())
-            .count()
+        (0..shared.config.max_chains).filter(|&index| !shared.slot(index).head.load(Ordering::Acquire).is_null()).count()
     }
 
     /// Takes every job not yet taken by a worker, from every lane and every chain slot, handing each to `f` (oldest
@@ -1043,21 +950,8 @@ pub struct GkMpmcChain<'a, N: TreiberNode, M: GkChannelMemory = GkHeapMemory> {
 }
 
 impl<'a, N: TreiberNode, M: GkChannelMemory> GkMpmcChain<'a, N, M> {
-    fn stolen(
-        shared: &'a GkMpmcShared<N, M>,
-        job: NonNull<N>,
-        slot: usize,
-        generation: u64,
-    ) -> Self {
-        Self {
-            shared,
-            next: job.as_ptr(),
-            private: ptr::null_mut(),
-            slot,
-            generation,
-            lane: 0,
-            published: false,
-        }
+    fn stolen(shared: &'a GkMpmcShared<N, M>, job: NonNull<N>, slot: usize, generation: u64) -> Self {
+        Self { shared, next: job.as_ptr(), private: ptr::null_mut(), slot, generation, lane: 0, published: false }
     }
 
     /// True if this chain comes from a fresh reap whose rest was published in a chain slot. Other workers take those
@@ -1082,9 +976,7 @@ impl<N: TreiberNode, M: GkChannelMemory> Iterator for GkMpmcChain<'_, N, M> {
         }
         // BRANCH: take the next job from the shared chain; stop once its jobs run out or a rescuer took it over
         if self.slot != NO_SLOT {
-            let job = self
-                .shared
-                .take_from_slot(self.slot, true, Some(self.generation), false);
+            let job = self.shared.take_from_slot(self.slot, true, Some(self.generation), false);
             if job.is_none() {
                 self.slot = NO_SLOT;
             }
@@ -1179,10 +1071,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcLane<N, M> {
             // Safety: the job is ours until the CAS publishes it.
             unsafe { (*job).next().store(head, Ordering::Relaxed) };
             // SeqCst: publishes the job and orders it before the pool's SeqCst state update.
-            match lane
-                .pending
-                .compare_exchange_weak(head, job, Ordering::SeqCst, Ordering::Relaxed)
-            {
+            match lane.pending.compare_exchange_weak(head, job, Ordering::SeqCst, Ordering::Relaxed) {
                 // BRANCH: published
                 Ok(_) => return,
                 // BRANCH: a worker reaped the lane meanwhile (or a spurious failure); retry on the new head
@@ -1208,10 +1097,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcLane<N, M> {
 
 impl<N: TreiberNode, M: GkChannelMemory> fmt::Debug for GkMpmcLane<N, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GkMpmcLane")
-            .field("index", &self.index)
-            .field("pushed", &self.pushed)
-            .finish()
+        f.debug_struct("GkMpmcLane").field("index", &self.index).field("pushed", &self.pushed).finish()
     }
 }
 

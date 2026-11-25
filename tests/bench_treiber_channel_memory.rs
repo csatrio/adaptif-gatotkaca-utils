@@ -83,17 +83,9 @@ struct Measured {
 
 fn treiber(producers: usize, bounded: bool) -> Measured {
     // A bounded channel can only back up to its bound: 4096 jobs per producer.
-    let per_producer = if bounded {
-        GK_SLAB_NODES as u64
-    } else {
-        PER_PRODUCER
-    };
+    let per_producer = if bounded { GK_SLAB_NODES as u64 } else { PER_PRODUCER };
     let base = live();
-    let channel = if bounded {
-        GkTreiberChannel::<u64>::new_bounded()
-    } else {
-        GkTreiberChannel::<u64>::new()
-    };
+    let channel = if bounded { GkTreiberChannel::<u64>::new_bounded() } else { GkTreiberChannel::<u64>::new() };
     let mut receiver = channel.receiver().unwrap();
     let senders: Vec<_> = (0..producers).map(|_| channel.sender().unwrap()).collect();
     let idle = live() - base;
@@ -123,15 +115,7 @@ fn treiber(producers: usize, bounded: bool) -> Measured {
     drop(senders);
     drop(receiver);
     drop(channel);
-    Measured {
-        messages: per_producer * producers as u64,
-        stages: Stages {
-            idle,
-            backlog,
-            drained,
-            closed: live() - base,
-        },
-    }
+    Measured { messages: per_producer * producers as u64, stages: Stages { idle, backlog, drained, closed: live() - base } }
 }
 
 fn crossbeam(producers: usize, capacity: Option<usize>) -> Measured {
@@ -167,15 +151,7 @@ fn crossbeam(producers: usize, capacity: Option<usize>) -> Measured {
     drop(senders);
     drop(tx);
     drop(rx);
-    Measured {
-        messages: per_producer * producers as u64,
-        stages: Stages {
-            idle,
-            backlog,
-            drained,
-            closed: live() - base,
-        },
-    }
+    Measured { messages: per_producer * producers as u64, stages: Stages { idle, backlog, drained, closed: live() - base } }
 }
 
 fn std_mpsc(producers: usize) -> Measured {
@@ -203,15 +179,7 @@ fn std_mpsc(producers: usize) -> Measured {
     drop(senders);
     drop(tx);
     drop(rx);
-    Measured {
-        messages: PER_PRODUCER * producers as u64,
-        stages: Stages {
-            idle,
-            backlog,
-            drained,
-            closed: live() - base,
-        },
-    }
+    Measured { messages: PER_PRODUCER * producers as u64, stages: Stages { idle, backlog, drained, closed: live() - base } }
 }
 
 /// Runs a scenario on its own thread so a hang fails the benchmark instead of blocking it.
@@ -238,7 +206,8 @@ fn treiber_channel_memory_vs_the_rest() {
     run(|| std_mpsc(1));
     PEAK.store(live(), Ordering::SeqCst);
     println!(
-        "\nheap KiB (live bytes above the pre-channel baseline); unbounded channels queue {PER_PRODUCER} u64 per producer,\nbounded ones fill up to their bound ({GK_SLAB_NODES} per producer for treiber, {GK_SLAB_NODES} in total for crossbeam)"
+        "\nheap KiB (live bytes above the pre-channel baseline); unbounded channels queue {PER_PRODUCER} u64 per producer,\n\
+         bounded ones fill up to their bound ({GK_SLAB_NODES} per producer for treiber, {GK_SLAB_NODES} in total for crossbeam)"
     );
     println!(
         "{:>9} {:<14} {:>10} {:>10} {:>12} {:>10} {:>9} {:>14}",
@@ -249,10 +218,7 @@ fn treiber_channel_memory_vs_the_rest() {
             ("treiber", run(move || treiber(producers, false))),
             ("treiber b4096", run(move || treiber(producers, true))),
             ("cb unbounded", run(move || crossbeam(producers, None))),
-            (
-                "cb b4096",
-                run(move || crossbeam(producers, Some(GK_SLAB_NODES))),
-            ),
+            ("cb b4096", run(move || crossbeam(producers, Some(GK_SLAB_NODES)))),
             ("std mpsc", run(move || std_mpsc(producers))),
         ];
         for (name, measured) in rows {

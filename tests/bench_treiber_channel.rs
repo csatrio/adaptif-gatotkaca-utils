@@ -91,14 +91,9 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 fn treiber(kind: Kind) -> GkTreiberChannel<u64> {
     // BRANCH: one config per treiber contender
     match kind {
-        Kind::TreiberSingle => GkTreiberChannel::with_config(
-            GkTreiberChannelConfig::DEFAULT.with_single_producer(true),
-        )
-        .unwrap(),
+        Kind::TreiberSingle => GkTreiberChannel::with_config(GkTreiberChannelConfig::DEFAULT.with_single_producer(true)).unwrap(),
         Kind::TreiberBounded => GkTreiberChannel::new_bounded(),
-        Kind::TreiberLifo => {
-            GkTreiberChannel::with_config(GkTreiberChannelConfig::DEFAULT.with_lifo(true)).unwrap()
-        }
+        Kind::TreiberLifo => GkTreiberChannel::with_config(GkTreiberChannelConfig::DEFAULT.with_lifo(true)).unwrap(),
         _ => GkTreiberChannel::new(),
     }
 }
@@ -273,9 +268,7 @@ fn ping_pong(kind: Kind) -> Vec<u64> {
 #[ignore]
 #[test]
 fn treiber_channel_vs_the_rest() {
-    println!(
-        "\nthroughput, M msgs/s (median of {ROUNDS}; {PER_PRODUCER} u64 per producer, 1 consumer)"
-    );
+    println!("\nthroughput, M msgs/s (median of {ROUNDS}; {PER_PRODUCER} u64 per producer, 1 consumer)");
     print!("{:>9}", "producers");
     for kind in KINDS {
         print!(" {:>14}", kind.name());
@@ -304,16 +297,11 @@ fn treiber_channel_vs_the_rest() {
         println!(" {:>15.2}x", results[2] / results[5]);
     }
 
-    println!(
-        "\nping-pong round trip, microseconds ({PING_PONGS} round trips, best of {ROUNDS} by p50)"
-    );
+    println!("\nping-pong round trip, microseconds ({PING_PONGS} round trips, best of {ROUNDS} by p50)");
     println!("{:>16} {:>9} {:>9} {:>9}", "", "p50", "p99", "max");
     for kind in KINDS {
         let runs: Vec<Vec<u64>> = (0..ROUNDS).map(|_| ping_pong(kind)).collect();
-        let best = runs
-            .into_iter()
-            .min_by_key(|times| percentile(times, 0.5))
-            .unwrap();
+        let best = runs.into_iter().min_by_key(|times| percentile(times, 0.5)).unwrap();
         println!(
             "{:>16} {:>9.1} {:>9.1} {:>9.1}",
             kind.name(),

@@ -57,10 +57,7 @@ impl<V> FastU64Map<V> {
     /// Creates an empty map with room for at least `capacity` entries.
     #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(HashMap::with_capacity_and_hasher(
-            capacity,
-            BuildNoHashHasher::default(),
-        ))
+        Self(HashMap::with_capacity_and_hasher(capacity, BuildNoHashHasher::default()))
     }
 
     /// Returns the inner `HashMap`.

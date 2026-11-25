@@ -75,13 +75,7 @@ enum Kind {
     Deque,
 }
 
-const KINDS: [Kind; 5] = [
-    Kind::Treiber,
-    Kind::ReapOnly,
-    Kind::Channel,
-    Kind::Injector,
-    Kind::Deque,
-];
+const KINDS: [Kind; 5] = [Kind::Treiber, Kind::ReapOnly, Kind::Channel, Kind::Injector, Kind::Deque];
 
 impl Kind {
     fn name(self) -> &'static str {
@@ -128,17 +122,11 @@ impl TreiberNode for Job {
 }
 
 fn boxed(id: u64, block_every: u64) -> Box<Job> {
-    Box::new(Job {
-        next: AtomicPtr::default(),
-        block: block_every != 0 && id % block_every == 0,
-    })
+    Box::new(Job { next: AtomicPtr::default(), block: block_every != 0 && id % block_every == 0 })
 }
 
 /// Runs a job: sleeps if it is a blocking one, then frees it.
-#[allow(
-    clippy::boxed_local,
-    reason = "each job is its own allocation, as in a pool"
-)]
+#[allow(clippy::boxed_local, reason = "each job is its own allocation, as in a pool")]
 fn run(job: Box<Job>) {
     // BRANCH: an `fsync` stand-in
     if job.block {
@@ -165,18 +153,9 @@ fn median(mut runs: Vec<f64>) -> f64 {
     runs[runs.len() / 2]
 }
 
-#[allow(
-    clippy::vec_box,
-    reason = "each job is its own allocation, as in a pool"
-)]
+#[allow(clippy::vec_box, reason = "each job is its own allocation, as in a pool")]
 fn batches(load: Load) -> Vec<Vec<Box<Job>>> {
-    (0..load.producers)
-        .map(|_| {
-            (0..load.per_producer)
-                .map(|id| boxed(id, load.block_every))
-                .collect()
-        })
-        .collect()
+    (0..load.producers).map(|_| (0..load.per_producer).map(|id| boxed(id, load.block_every)).collect()).collect()
 }
 
 // ==== Runs ====
@@ -186,16 +165,8 @@ fn treiber(load: Load, config: GkTreiberMpmcConfig) -> f64 {
     within_limit(move || {
         let queue = GkTreiberMpmc::<Job>::with_config(config).unwrap();
         let done = Arc::new(AtomicBool::new(false));
-        let jobs: Vec<_> = batches(load)
-            .into_iter()
-            .map(|jobs| {
-                Jobs(
-                    jobs.into_iter()
-                        .map(|job| NonNull::from(Box::leak(job)))
-                        .collect(),
-                )
-            })
-            .collect();
+        let jobs: Vec<_> =
+            batches(load).into_iter().map(|jobs| Jobs(jobs.into_iter().map(|job| NonNull::from(Box::leak(job))).collect())).collect();
         let lanes: Vec<_> = (0..load.producers).map(|_| queue.lane().unwrap()).collect();
         let start = Instant::now();
         let producer_handles: Vec<_> = lanes
@@ -226,10 +197,7 @@ fn treiber(load: Load, config: GkTreiberMpmcConfig) -> f64 {
                                 run(unsafe { Box::from_raw(job.as_ptr()) });
                                 taken += 1;
                             }
-                        } else if done.load(Ordering::Acquire)
-                            && !queue.has_work()
-                            && queue.shared_chains() == 0
-                        {
+                        } else if done.load(Ordering::Acquire) && !queue.has_work() && queue.shared_chains() == 0 {
                             return taken;
                         } else {
                             std::hint::spin_loop();
@@ -298,8 +266,7 @@ fn deque(load: Load, local_deques: bool) -> f64 {
         let done = Arc::new(AtomicBool::new(false));
         let jobs = batches(load);
         let locals: Vec<Worker<Box<Job>>> = (0..load.workers).map(|_| Worker::new_fifo()).collect();
-        let stealers: Arc<Vec<Stealer<Box<Job>>>> =
-            Arc::new(locals.iter().map(Worker::stealer).collect());
+        let stealers: Arc<Vec<Stealer<Box<Job>>>> = Arc::new(locals.iter().map(Worker::stealer).collect());
         let start = Instant::now();
         let producer_handles: Vec<_> = jobs
             .into_iter()
@@ -345,10 +312,7 @@ fn deque(load: Load, local_deques: bool) -> f64 {
                             Steal::Empty => {
                                 // BRANCH: the producers are finished and nothing is left (other workers finish their
                                 // own local jobs)
-                                if done.load(Ordering::Acquire)
-                                    && injector.is_empty()
-                                    && local.is_empty()
-                                {
+                                if done.load(Ordering::Acquire) && injector.is_empty() && local.is_empty() {
                                     return taken;
                                 }
                                 std::hint::spin_loop();
@@ -386,12 +350,7 @@ fn bench_mpmc_throughput() {
     header("M jobs/s");
     for producers in PRODUCER_COUNTS {
         for workers in WORKER_COUNTS {
-            let load = Load {
-                producers,
-                workers,
-                per_producer: THROUGHPUT_JOBS,
-                block_every: 0,
-            };
+            let load = Load { producers, workers, per_producer: THROUGHPUT_JOBS, block_every: 0 };
             print!("{producers:>4} {workers:>4}");
             for kind in KINDS {
                 let secs = median((0..ROUNDS).map(|_| kind.run(load)).collect());
@@ -411,12 +370,7 @@ fn bench_mpmc_blocking() {
     );
     header("ms");
     for (producers, workers) in BLOCKING_SHAPES {
-        let load = Load {
-            producers,
-            workers,
-            per_producer: BLOCKING_JOBS,
-            block_every: BLOCK_EVERY,
-        };
+        let load = Load { producers, workers, per_producer: BLOCKING_JOBS, block_every: BLOCK_EVERY };
         print!("{producers:>4} {workers:>4}");
         for kind in KINDS {
             let secs = median((0..ROUNDS).map(|_| kind.run(load)).collect());

@@ -3,10 +3,7 @@
 
 // ==== Import Definition ====
 
-use adaptif_gatotkaca_utils::{
-    GkChannelMemory, GkRegionMemory, GkTreiberChannelError, GkTreiberMpmc, GkTreiberMpmcConfig,
-    TreiberNode,
-};
+use adaptif_gatotkaca_utils::{GkChannelMemory, GkRegionMemory, GkTreiberChannelError, GkTreiberMpmc, GkTreiberMpmcConfig, TreiberNode};
 
 use std::{
     ptr::NonNull,
@@ -40,12 +37,7 @@ impl TreiberNode for Job {
 }
 
 fn job(lane: usize, seq: u64) -> NonNull<Job> {
-    NonNull::new(Box::into_raw(Box::new(Job {
-        next: AtomicPtr::default(),
-        lane,
-        seq,
-    })))
-    .unwrap()
+    NonNull::new(Box::into_raw(Box::new(Job { next: AtomicPtr::default(), lane, seq }))).unwrap()
 }
 
 fn take(job: NonNull<Job>) -> Box<Job> {
@@ -66,8 +58,7 @@ fn within<R: Send + 'static>(mut seconds: u64, f: impl FnOnce() -> R + Send + 's
     thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(Duration::from_secs(seconds))
-        .expect("test timed out")
+    rx.recv_timeout(Duration::from_secs(seconds)).expect("test timed out")
 }
 
 /// One `try_reap`, run to the end: the (lane, seq) of each job, in order.
@@ -111,10 +102,7 @@ fn one_reap_takes_the_whole_lane_in_push_order() {
     assert!(queue.has_work());
     let chain = queue.try_reap().unwrap();
     assert!(chain.published());
-    assert_eq!(
-        chain.map(seq).collect::<Vec<_>>(),
-        (0..1000).collect::<Vec<_>>()
-    );
+    assert_eq!(chain.map(seq).collect::<Vec<_>>(), (0..1000).collect::<Vec<_>>());
     assert!(queue.try_reap().is_none());
     assert!(!queue.has_work());
     // A single job has nothing to share.
@@ -143,9 +131,7 @@ fn chains_between_pushes_stay_in_order() {
 #[test]
 fn a_blocked_chain_is_taken_over() {
     let delay = Duration::from_millis(2);
-    let queue =
-        GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_rescue_after(delay))
-            .unwrap();
+    let queue = GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_rescue_after(delay)).unwrap();
     let mut lane = queue.lane().unwrap();
     push_range(&mut lane, 0..100);
     // Worker A reaps and "blocks" in its first job.
@@ -174,10 +160,7 @@ fn a_blocked_chain_is_taken_over() {
 
 #[test]
 fn a_busy_chain_is_not_taken_over() {
-    let queue = GkTreiberMpmc::<Job>::with_config(
-        GkTreiberMpmcConfig::DEFAULT.with_rescue_after(Duration::from_secs(60)),
-    )
-    .unwrap();
+    let queue = GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_rescue_after(Duration::from_secs(60))).unwrap();
     let mut lane = queue.lane().unwrap();
     push_range(&mut lane, 0..10);
     let mut a = queue.try_reap().unwrap();
@@ -192,8 +175,7 @@ fn a_busy_chain_is_not_taken_over() {
 
 #[test]
 fn zero_chain_slots_keep_the_chain_private() {
-    let queue =
-        GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_chains(0)).unwrap();
+    let queue = GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_chains(0)).unwrap();
     let mut lane = queue.lane().unwrap();
     push_range(&mut lane, 0..100);
     let mut a = queue.try_reap().unwrap();
@@ -208,10 +190,7 @@ fn zero_chain_slots_keep_the_chain_private() {
 #[test]
 fn a_dropped_chain_gives_its_jobs_back() {
     // No rescue delay: the dropped chain has no owner, and this test takes it over at once.
-    let queue = GkTreiberMpmc::<Job>::with_config(
-        GkTreiberMpmcConfig::DEFAULT.with_rescue_after(Duration::ZERO),
-    )
-    .unwrap();
+    let queue = GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_rescue_after(Duration::ZERO)).unwrap();
     let mut lane = queue.lane().unwrap();
     push_range(&mut lane, 0..10);
     // Dropped before taking anything: the first job is shared again, the rest already is.
@@ -241,14 +220,10 @@ fn ranks_the_largest_backlog_first() {
 
 #[test]
 fn lane_limit_and_reuse() {
-    let queue =
-        GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_lanes(2)).unwrap();
+    let queue = GkTreiberMpmc::<Job>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_lanes(2)).unwrap();
     let mut first = queue.lane().unwrap();
     let second = queue.lane().unwrap();
-    assert_eq!(
-        queue.lane().unwrap_err(),
-        GkTreiberChannelError::TOO_MANY_LANES
-    );
+    assert_eq!(queue.lane().unwrap_err(), GkTreiberChannelError::TOO_MANY_LANES);
     assert_eq!((first.index(), second.index()), (0, 1));
     push_range(&mut first, 0..6);
     // Released with jobs still queued: they stay, and the next owner's jobs come after them.
@@ -300,10 +275,7 @@ fn invalid_config() {
         GkTreiberMpmcConfig::DEFAULT.with_max_lanes(usize::MAX),
         GkTreiberMpmcConfig::DEFAULT.with_max_chains(usize::MAX),
     ] {
-        assert_eq!(
-            GkTreiberMpmc::<Job>::with_config(config).unwrap_err(),
-            GkTreiberChannelError::INVALID_CONFIG
-        );
+        assert_eq!(GkTreiberMpmc::<Job>::with_config(config).unwrap_err(), GkTreiberChannelError::INVALID_CONFIG);
     }
 }
 
@@ -336,17 +308,10 @@ impl TreiberNode for Counted {
 
 #[test]
 fn unrun_jobs_are_freed() {
-    let counted = || {
-        NonNull::new(Box::into_raw(Box::new(Counted {
-            next: AtomicPtr::default(),
-        })))
-        .unwrap()
-    };
+    let counted = || NonNull::new(Box::into_raw(Box::new(Counted { next: AtomicPtr::default() }))).unwrap();
     let run = |job: NonNull<Counted>| drop(unsafe { Box::from_raw(job.as_ptr()) });
     // Without chain slots, a chain dropped half-run puts the rest back on its lane; the last handle frees it.
-    let private =
-        GkTreiberMpmc::<Counted>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_chains(0))
-            .unwrap();
+    let private = GkTreiberMpmc::<Counted>::with_config(GkTreiberMpmcConfig::DEFAULT.with_max_chains(0)).unwrap();
     let mut lane = private.lane().unwrap();
     for _ in 0..50 {
         unsafe { lane.push(counted()) };
@@ -387,13 +352,7 @@ fn region_memory_is_given_back() {
     let base = NonNull::new(buffer.as_mut_ptr().cast::<u8>()).unwrap();
     // Safety: the buffer outlives the queue and nothing else uses it.
     let region = unsafe { GkRegionMemory::new(base, buffer.len() * 8) }.unwrap();
-    let queue = GkTreiberMpmc::<Job, _>::with_memory(
-        GkTreiberMpmcConfig::DEFAULT
-            .with_max_lanes(4)
-            .with_max_chains(8),
-        region,
-    )
-    .unwrap();
+    let queue = GkTreiberMpmc::<Job, _>::with_memory(GkTreiberMpmcConfig::DEFAULT.with_max_lanes(4).with_max_chains(8), region).unwrap();
     assert!(region.in_use() > 0);
     let mut lane = queue.lane().unwrap();
     let index = lane.index();
@@ -462,11 +421,7 @@ fn exactly_once_with_short_lived_workers() {
     const WORKERS: usize = 8;
     within(120, || {
         let queue = GkTreiberMpmc::<Job>::new();
-        let seen: Arc<Vec<AtomicBool>> = Arc::new(
-            (0..PRODUCERS as u64 * PER)
-                .map(|_| AtomicBool::new(false))
-                .collect(),
-        );
+        let seen: Arc<Vec<AtomicBool>> = Arc::new((0..PRODUCERS as u64 * PER).map(|_| AtomicBool::new(false)).collect());
         let taken = Arc::new(AtomicU64::new(0));
         let producers: Vec<_> = (0..PRODUCERS)
             .map(|_| {
@@ -530,8 +485,8 @@ fn exactly_once_with_short_lived_workers() {
 
 /// A pool-style handshake: a worker announces itself asleep with a `SeqCst` RMW on the state word, re-checks
 /// `has_work` and only then waits; a producer pushes, then does a `SeqCst` RMW on the same word and wakes a worker if
-/// any is asleep. While chains are shared, a worker parks with a timeout, to rescue one that stalls. Small bursts keep the workers parking all
-/// the time. A lost wake-up hangs, and the test times out.
+/// any is asleep. While chains are shared, a worker parks with a timeout, to rescue one that stalls. Small bursts keep
+/// the workers parking all the time. A lost wake-up hangs, and the test times out.
 #[test]
 fn no_lost_wakeups_with_pool_handshake() {
     const PRODUCERS: usize = 3;
@@ -590,13 +545,7 @@ fn no_lost_wakeups_with_pool_handshake() {
                         }
                         // BRANCH: a shared chain may stall with nobody to signal it; wake in time to rescue it
                         let guard = if shared {
-                            pool.wake
-                                .wait_timeout(
-                                    guard,
-                                    2 * adaptif_gatotkaca_utils::GK_MPMC_RESCUE_AFTER,
-                                )
-                                .unwrap()
-                                .0
+                            pool.wake.wait_timeout(guard, 2 * adaptif_gatotkaca_utils::GK_MPMC_RESCUE_AFTER).unwrap().0
                         } else {
                             pool.wake.wait(guard).unwrap()
                         };

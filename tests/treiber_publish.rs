@@ -25,10 +25,7 @@ impl TreiberNode for Node {
 }
 
 fn node(v: u64) -> *mut Node {
-    Box::into_raw(Box::new(Node {
-        next: AtomicPtr::new(ptr::null_mut()),
-        value: vec![v; 3],
-    }))
+    Box::into_raw(Box::new(Node { next: AtomicPtr::new(ptr::null_mut()), value: vec![v; 3] }))
 }
 
 struct SendPtr(*mut Node);

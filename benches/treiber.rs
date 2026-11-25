@@ -21,13 +21,7 @@ impl TreiberNode for Node {
 }
 
 fn nodes(n: usize) -> Vec<*mut Node> {
-    (0..n)
-        .map(|_| {
-            Box::into_raw(Box::new(Node {
-                next: AtomicPtr::new(ptr::null_mut()),
-            }))
-        })
-        .collect()
+    (0..n).map(|_| Box::into_raw(Box::new(Node { next: AtomicPtr::new(ptr::null_mut()) }))).collect()
 }
 
 struct SendPtrs(Vec<*mut Node>);
@@ -38,11 +32,7 @@ fn bench(c: &mut Criterion) {
     for producers in [1usize, 4, 8] {
         c.bench_function(&format!("push_to_stack/{producers}_producers"), |b| {
             b.iter_batched(
-                || {
-                    (0..producers)
-                        .map(|_| SendPtrs(nodes(PER_PRODUCER)))
-                        .collect::<Vec<_>>()
-                },
+                || (0..producers).map(|_| SendPtrs(nodes(PER_PRODUCER))).collect::<Vec<_>>(),
                 |batches| {
                     let stack: AtomicPtr<Node> = AtomicPtr::new(ptr::null_mut());
                     thread::scope(|s| {
@@ -57,10 +47,7 @@ fn bench(c: &mut Criterion) {
                         }
                     });
                     // iterator() drops (frees) every node.
-                    stack
-                        .reap_all()
-                        .iterator()
-                        .for_each(|p| drop(unsafe { Box::from_raw(p) }));
+                    stack.reap_all().iterator().for_each(|p| drop(unsafe { Box::from_raw(p) }));
                 },
                 BatchSize::LargeInput,
             )

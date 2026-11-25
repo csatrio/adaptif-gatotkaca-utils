@@ -1,0 +1,21 @@
+# Editor defaults for files rustfmt does not touch (Markdown, TOML, scripts). Rust code is formatted by rustfmt.toml.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{rs,toml}]
+max_line_length = 140
+
+[*.md]
+max_line_length = 120
+# Two trailing spaces are a Markdown line break.
+trim_trailing_whitespace = false
+
+[*.{yml,yaml,json}]
+indent_size = 2

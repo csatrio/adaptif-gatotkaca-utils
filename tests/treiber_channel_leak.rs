@@ -117,11 +117,7 @@ fn parking_round() {
 fn nothing_leaks_in_any_ending() {
     // Warm up the allocator and thread machinery, then measure.
     round(Ending::ReceiverLast);
-    for ending in [
-        Ending::ReceiverLast,
-        Ending::ReceiverFirst,
-        Ending::JobsOutliveBoth,
-    ] {
+    for ending in [Ending::ReceiverLast, Ending::ReceiverFirst, Ending::JobsOutliveBoth] {
         let before = LIVE.load(Ordering::SeqCst);
         for _ in 0..3 {
             round(ending);

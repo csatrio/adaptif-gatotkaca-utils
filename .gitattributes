@@ -1,0 +1,5 @@
+# Always LF in the repository and the working tree, whatever the OS (a Windows checkout must not turn files into CRLF).
+* text=auto eol=lf
+*.rs text eol=lf diff=rust
+*.toml text eol=lf
+*.md text eol=lf

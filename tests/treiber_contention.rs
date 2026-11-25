@@ -23,11 +23,7 @@ impl TreiberNode for Node {
 }
 
 fn node(producer: u32, seq: u32) -> *mut Node {
-    Box::into_raw(Box::new(Node {
-        next: AtomicPtr::new(ptr::null_mut()),
-        producer,
-        seq,
-    }))
+    Box::into_raw(Box::new(Node { next: AtomicPtr::new(ptr::null_mut()), producer, seq }))
 }
 
 /// Reaps, frees every node and returns (producer, seq) in yielded order.
@@ -44,11 +40,7 @@ fn drain(head: AtomicPtr<Node>) -> Vec<(u32, u32)> {
 fn many_producers_one_reaper_exactly_once_and_in_order() {
     const PRODUCERS: u32 = 8;
     // Debug builds allocate slowly, so use fewer nodes there.
-    const PER_PRODUCER: u32 = if cfg!(debug_assertions) {
-        100_000
-    } else {
-        1_000_000
-    };
+    const PER_PRODUCER: u32 = if cfg!(debug_assertions) { 100_000 } else { 1_000_000 };
 
     let stack: AtomicPtr<Node> = AtomicPtr::new(ptr::null_mut());
     let done = AtomicBool::new(false);
@@ -127,10 +119,7 @@ fn push_chain_stays_contiguous_and_ordered() {
 
     let out = drain(stack.reap_all());
     let chains = CHAIN_THREADS * CHAINS_PER_THREAD;
-    assert_eq!(
-        out.len() as u32,
-        chains * CHAIN_LEN + SINGLE_THREADS * SINGLES_PER_THREAD
-    );
+    assert_eq!(out.len() as u32, chains * CHAIN_LEN + SINGLE_THREADS * SINGLES_PER_THREAD);
 
     // Every chain: 64 consecutive entries, seq 0..64 in order.
     let mut i = 0;
@@ -216,9 +205,7 @@ fn run_queue(limit: usize, threads: u32, per_thread: u32, concurrent_reap: bool)
     // Every node was either reaped or rejected, never both, never lost.
     let mut all: Vec<_> = reaped.iter().chain(rejected.iter()).copied().collect();
     all.sort_unstable();
-    let expected: Vec<_> = (0..threads)
-        .flat_map(|id| (0..per_thread).map(move |seq| (id, seq)))
-        .collect();
+    let expected: Vec<_> = (0..threads).flat_map(|id| (0..per_thread).map(move |seq| (id, seq))).collect();
     assert_eq!(all, expected);
 
     if !concurrent_reap {

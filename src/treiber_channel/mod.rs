@@ -291,10 +291,7 @@ impl GkTreiberChannelConfig {
     pub const fn validate(&self) -> Result<(), GkTreiberChannelError> {
         // BRANCH: a bounded sender without a slab, or an unbounded one that cannot grow, could never send; an empty batch
         // is meaningless
-        if (self.bounded && self.slab_nodes == 0)
-            || (!self.bounded && self.grow_nodes == 0)
-            || self.return_batch == 0
-        {
+        if (self.bounded && self.slab_nodes == 0) || (!self.bounded && self.grow_nodes == 0) || self.return_batch == 0 {
             return Err(GkTreiberChannelError::INVALID_CONFIG);
         }
         Ok(())
@@ -347,19 +344,12 @@ struct GkJobNode<T, M: GkChannelMemory> {
 ///
 /// # Safety
 /// `base` must be valid for writes of `len` nodes that nothing else references.
-unsafe fn link_nodes<T, M: GkChannelMemory>(
-    base: *mut GkJobNode<T, M>,
-    len: usize,
-    tail: *mut GkJobNode<T, M>,
-) -> *mut GkJobNode<T, M> {
+unsafe fn link_nodes<T, M: GkChannelMemory>(base: *mut GkJobNode<T, M>, len: usize, tail: *mut GkJobNode<T, M>) -> *mut GkJobNode<T, M> {
     for i in 0..len {
         // Safety: `i` is inside the block; `i + 1` is at most one past the end.
         unsafe {
             let next = if i + 1 < len { base.add(i + 1) } else { tail };
-            base.add(i).write(GkJobNode {
-                next: AtomicPtr::new(next),
-                payload: MaybeUninit::uninit(),
-            });
+            base.add(i).write(GkJobNode { next: AtomicPtr::new(next), payload: MaybeUninit::uninit() });
         }
     }
     if len == 0 { tail } else { base }
@@ -375,9 +365,7 @@ struct GkChunk {
 
 /// Layout of a chunk of `len` nodes, and the offset of its first node.
 fn chunk_layout<T, M: GkChannelMemory>(len: usize) -> Option<(Layout, usize)> {
-    let (layout, offset) = Layout::new::<GkChunk>()
-        .extend(Layout::array::<GkJobNode<T, M>>(len).ok()?)
-        .ok()?;
+    let (layout, offset) = Layout::new::<GkChunk>().extend(Layout::array::<GkJobNode<T, M>>(len).ok()?).ok()?;
     Some((layout.pad_to_align(), offset))
 }
 
@@ -416,10 +404,7 @@ fn orphan<T, M: GkChannelMemory>() -> *mut GkJobNode<T, M> {
 /// # Safety
 /// `node` must be valid, owned by the caller and in no stack; `outbox` must belong to the caller's thread channel.
 #[inline(always)]
-unsafe fn submit<T, M: GkChannelMemory>(
-    outbox: &AtomicPtr<GkJobNode<T, M>>,
-    node: *mut GkJobNode<T, M>,
-) {
+unsafe fn submit<T, M: GkChannelMemory>(outbox: &AtomicPtr<GkJobNode<T, M>>, node: *mut GkJobNode<T, M>) {
     let mut head = outbox.load(Ordering::Relaxed);
     loop {
         // Safety: the node is ours until the CAS publishes it.
@@ -474,11 +459,7 @@ unsafe fn return_chain<T, M: GkChannelMemory>(
 /// # Safety
 /// Same as [`return_chain`].
 #[cold]
-unsafe fn return_orphaned<T, M: GkChannelMemory>(
-    channel: *const GkThreadChannel<T, M>,
-    _first: *mut GkJobNode<T, M>,
-    count: usize,
-) {
+unsafe fn return_orphaned<T, M: GkChannelMemory>(channel: *const GkThreadChannel<T, M>, _first: *mut GkJobNode<T, M>, count: usize) {
     // Every node lives in the slab or a chunk, both freed with the channel: only the counts are released.
     // Safety: the nodes held `count` counts; the channel is alive until they are released.
     unsafe { release(channel, count as isize) };
@@ -589,8 +570,7 @@ unsafe fn free_chunk<T, M: GkChannelMemory>(memory: &M, chunk: *mut GkChunk, len
 /// # Safety
 /// `slab` must come from [`alloc_slab`] on a clone of `memory` with the same `len`, and not be used again.
 unsafe fn free_slab<T, M: GkChannelMemory>(memory: &M, slab: *mut GkJobNode<T, M>, len: usize) {
-    let layout =
-        Layout::array::<GkJobNode<T, M>>(len).expect("slab layout was valid when allocated");
+    let layout = Layout::array::<GkJobNode<T, M>>(len).expect("slab layout was valid when allocated");
     // BRANCH: an empty slab took no memory
     if layout.size() != 0 {
         // Safety: forwarded from this function's contract.
@@ -732,9 +712,7 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkSharedRef<T, W, M> {
         let memory = shared.memory.clone();
         let ptr = alloc_value(&memory, shared)?;
         // Safety: `alloc_value` never returns null.
-        Some(Self {
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
-        })
+        Some(Self { ptr: unsafe { NonNull::new_unchecked(ptr) } })
     }
 }
 
@@ -802,9 +780,7 @@ unsafe impl<T: Send, W: GkWaker, M: GkChannelMemory> Sync for GkTreiberChannel<T
 
 impl<T, W: GkWaker, M: GkChannelMemory> Clone for GkTreiberChannel<T, W, M> {
     fn clone(&self) -> Self {
-        Self {
-            shared: self.shared.clone(),
-        }
+        Self { shared: self.shared.clone() }
     }
 }
 
@@ -817,8 +793,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory + Default> Default for GkTreiberCha
 impl<T: Send, W: GkWaker, M: GkChannelMemory + Default> GkTreiberChannel<T, W, M> {
     /// Creates an unbounded channel with the default configuration.
     pub fn new() -> Self {
-        Self::with_memory(GkTreiberChannelConfig::DEFAULT, M::default())
-            .expect("default memory allocates")
+        Self::with_memory(GkTreiberChannelConfig::DEFAULT, M::default()).expect("default memory allocates")
     }
 
     /// Creates a bounded channel with the default configuration: every sender owns exactly
@@ -826,11 +801,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory + Default> GkTreiberChannel<T, W, M
     /// receiver has not taken yet, [`GkSender::send`] waits (spinning, then yielding) and [`GkSender::try_send`] returns
     /// `Full`. The bound is per sender, so the channel holds at most `senders * slab_nodes` jobs.
     pub fn new_bounded() -> Self {
-        Self::with_memory(
-            GkTreiberChannelConfig::DEFAULT.with_bounded(true),
-            M::default(),
-        )
-        .expect("default memory allocates")
+        Self::with_memory(GkTreiberChannelConfig::DEFAULT.with_bounded(true), M::default()).expect("default memory allocates")
     }
 
     /// Creates a channel with `config`. Fails with `INVALID_CONFIG` (allocating nothing) if
@@ -844,10 +815,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
     /// Creates a channel whose every allocation (shared state, thread channels, slabs, heap nodes, the receiver's waker)
     /// comes from `memory`. Fails with `INVALID_CONFIG` if `config` is rejected and with `OUT_OF_MEMORY` if `memory` has
     /// no room; neither error allocates.
-    pub fn with_memory(
-        config: GkTreiberChannelConfig,
-        memory: M,
-    ) -> Result<Self, GkTreiberChannelError> {
+    pub fn with_memory(config: GkTreiberChannelConfig, memory: M) -> Result<Self, GkTreiberChannelError> {
         config.validate()?;
         let shared = GkSharedRef::new(GkShared {
             waiter: CachePadded::new(AtomicPtr::new(ptr::null_mut())),
@@ -895,10 +863,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
         let channel = alloc_slab::<T, M>(memory, nodes).and_then(|slab| {
             let channel = GkThreadChannel {
                 inbox: CachePadded::new(AtomicPtr::new(ptr::null_mut())),
-                outbox: CachePadded::new(GkOutbox {
-                    head: AtomicPtr::new(ptr::null_mut()),
-                    gone: AtomicBool::new(false),
-                }),
+                outbox: CachePadded::new(GkOutbox { head: AtomicPtr::new(ptr::null_mut()), gone: AtomicBool::new(false) }),
                 registry_next: AtomicPtr::new(ptr::null_mut()),
                 pending: AtomicIsize::new(0),
                 slab,
@@ -948,10 +913,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
 
     /// Takes the single receiver, which sleeps and is woken with `waker`. Fails with `RECEIVER_TAKEN` if it was taken
     /// already, and with `OUT_OF_MEMORY` if the memory has no room for the waker (the receiver can be taken again).
-    pub fn receiver_with_waker(
-        &self,
-        waker: W,
-    ) -> Result<GkReceiver<T, W, M>, GkTreiberChannelError> {
+    pub fn receiver_with_waker(&self, waker: W) -> Result<GkReceiver<T, W, M>, GkTreiberChannelError> {
         // BRANCH: only one receiver may exist
         if self.shared.receiver_taken.swap(true, Ordering::AcqRel) {
             return Err(GkTreiberChannelError::RECEIVER_TAKEN);
@@ -1089,22 +1051,11 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
     fn grow(&mut self) -> Option<*mut GkJobNode<T, M>> {
         let len = self.grow_nodes;
         let (layout, _) = chunk_layout::<T, M>(len)?;
-        let chunk = self
-            .shared
-            .memory
-            .allocate(layout)?
-            .as_ptr()
-            .cast::<GkChunk>();
+        let chunk = self.shared.memory.allocate(layout)?.as_ptr().cast::<GkChunk>();
         // Safety: the channel lives at least as long as this sender, and only the owner changes its chunk list.
         let chunks = unsafe { &(*self.channel).chunks };
         // Safety: fresh memory for the header and `len` nodes.
-        unsafe {
-            chunk.write(GkChunk {
-                next: chunks.load(Ordering::Relaxed),
-                len,
-                home: 0,
-            })
-        };
+        unsafe { chunk.write(GkChunk { next: chunks.load(Ordering::Relaxed), len, home: 0 }) };
         chunks.store(chunk, Ordering::Relaxed);
         self.allocated += len;
         // Safety: as above.
@@ -1124,11 +1075,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
         }
         // Every node at home goes to `local`, so the count per chunk below is complete.
         // Safety: the channel lives at least as long as this sender; the swapped chain is ours.
-        let returned = unsafe {
-            (*self.channel)
-                .inbox
-                .swap(ptr::null_mut(), Ordering::Acquire)
-        };
+        let returned = unsafe { (*self.channel).inbox.swap(ptr::null_mut(), Ordering::Acquire) };
         let mut node = returned;
         while !node.is_null() {
             // Safety: the swapped chain is ours.
@@ -1192,11 +1139,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
     ///
     /// # Safety
     /// `first` must be the sender's chunk list and `hint` null or one of its chunks.
-    unsafe fn chunk_of(
-        first: *mut GkChunk,
-        hint: *mut GkChunk,
-        node: *mut GkJobNode<T, M>,
-    ) -> *mut GkChunk {
+    unsafe fn chunk_of(first: *mut GkChunk, hint: *mut GkChunk, node: *mut GkJobNode<T, M>) -> *mut GkChunk {
         let contains = |chunk: *mut GkChunk| {
             let start = chunk_nodes::<T, M>(chunk);
             // Safety: forwarded from this function's contract.
@@ -1282,11 +1225,7 @@ struct GkReturnBatch<T, M: GkChannelMemory> {
 }
 
 impl<T, M: GkChannelMemory> GkReturnBatch<T, M> {
-    const EMPTY: Self = Self {
-        channel: ptr::null(),
-        first: ptr::null_mut(),
-        count: 0,
-    };
+    const EMPTY: Self = Self { channel: ptr::null(), first: ptr::null_mut(), count: 0 };
 }
 
 /// The consuming end. Takes jobs from every thread channel; there is one per channel.
@@ -1403,8 +1342,7 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 self.retract();
                 continue;
             }
-            let timeout =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             // Safety: the waker lives as long as the shared state; only this receiver changes it, and it is not
             // changing it now. A producer may be calling `unpark` on it at the same time, which `&self` allows.
             unsafe { (*waker).park(timeout) };
@@ -1529,12 +1467,7 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             return None;
         }
         // Safety: chain nodes are valid, owned by this receiver and hold a payload, which is read once here.
-        let (next, value) = unsafe {
-            (
-                (*node).next.load(Ordering::Relaxed),
-                ptr::read((*node).payload.as_ptr()),
-            )
-        };
+        let (next, value) = unsafe { ((*node).next.load(Ordering::Relaxed), ptr::read((*node).payload.as_ptr())) };
         self.head = next;
         self.chain_len += 1;
         self.returns.count += 1;
@@ -1615,11 +1548,7 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                     self.channels = next;
                 } else {
                     // Safety: `cursor_prev` is registered and owned by this list.
-                    unsafe {
-                        (*self.cursor_prev)
-                            .registry_next
-                            .store(next, Ordering::Relaxed)
-                    };
+                    unsafe { (*self.cursor_prev).registry_next.store(next, Ordering::Relaxed) };
                 }
                 // Safety: released once; the jobs just taken keep the channel alive through `pending`.
                 unsafe { release(channel, 1) };
@@ -1630,17 +1559,9 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             // BRANCH: this sender had jobs; they become the current chain
             if !taken.is_null() {
                 // BRANCH: lifo hands the chain out as it is (newest first); otherwise reverse it to oldest first
-                self.head = if self.lifo {
-                    taken
-                } else {
-                    GkJobNode::reverse_in_place(taken).0
-                };
+                self.head = if self.lifo { taken } else { GkJobNode::reverse_in_place(taken).0 };
                 // The return batch starts at the chain's head (nothing is pending from the previous chain).
-                self.returns = GkReturnBatch {
-                    channel,
-                    first: self.head,
-                    count: 0,
-                };
+                self.returns = GkReturnBatch { channel, first: self.head, count: 0 };
                 return true;
             }
         }
@@ -1665,9 +1586,7 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 }
                 last = next;
             }
-            (*last)
-                .registry_next
-                .store(self.channels, Ordering::Relaxed);
+            (*last).registry_next.store(self.channels, Ordering::Relaxed);
         }
         self.channels = fresh;
     }

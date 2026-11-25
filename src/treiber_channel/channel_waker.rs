@@ -54,9 +54,7 @@ pub struct GkThreadWaker {
 
 impl Default for GkThreadWaker {
     fn default() -> Self {
-        Self {
-            thread: thread::current(),
-        }
+        Self { thread: thread::current() }
     }
 }
 
@@ -101,10 +99,7 @@ pub struct GkTaskWaker {
 
 impl Default for GkTaskWaker {
     fn default() -> Self {
-        Self {
-            waker: None,
-            step: Duration::from_micros(200),
-        }
+        Self { waker: None, step: Duration::from_micros(200) }
     }
 }
 
@@ -129,11 +124,7 @@ impl GkAsyncWaker for GkTaskWaker {
     #[inline]
     fn register(&mut self, waker: &Waker) {
         // BRANCH: same task as last time is the common case, and costs no clone
-        if !self
-            .waker
-            .as_ref()
-            .is_some_and(|known| known.will_wake(waker))
-        {
+        if !self.waker.as_ref().is_some_and(|known| known.will_wake(waker)) {
             self.waker = Some(waker.clone());
         }
     }

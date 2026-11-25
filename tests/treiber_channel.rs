@@ -1,8 +1,7 @@
 // ==== Import Definition ====
 
 use adaptif_gatotkaca_utils::treiber_channel::{
-    GK_GROW_NODES, GK_RETURN_BATCH, GK_SLAB_NODES, GkTreiberChannel, GkTreiberChannelConfig,
-    GkTreiberChannelError, GkTrySendError,
+    GK_GROW_NODES, GK_RETURN_BATCH, GK_SLAB_NODES, GkTreiberChannel, GkTreiberChannelConfig, GkTreiberChannelError, GkTrySendError,
 };
 
 use std::{
@@ -23,8 +22,7 @@ fn within<R: Send + 'static>(seconds: u64, f: impl FnOnce() -> R + Send + 'stati
     thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(Duration::from_secs(seconds))
-        .expect("test timed out")
+    rx.recv_timeout(Duration::from_secs(seconds)).expect("test timed out")
 }
 
 /// A payload that counts its drops.
@@ -160,14 +158,8 @@ fn senders_take_turns_one_chain_each() {
         assert_eq!(got.len(), 6);
         let first = got[0].0;
         assert!(got[..3].iter().all(|&(from, _)| from == first));
-        assert_eq!(
-            got[..3].iter().map(|&(_, n)| n).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(
-            got[3..].iter().map(|&(_, n)| n).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
+        assert_eq!(got[..3].iter().map(|&(_, n)| n).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(got[3..].iter().map(|&(_, n)| n).collect::<Vec<_>>(), vec![0, 1, 2]);
     });
 }
 
@@ -178,21 +170,13 @@ fn recv_timeout_returns_early_when_a_job_arrives() {
         let mut sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
         let start = std::time::Instant::now();
-        let consumer = thread::spawn(move || {
-            (
-                receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
-                receiver,
-            )
-        });
+        let consumer = thread::spawn(move || (receiver.recv_timeout(Duration::from_secs(10)).unwrap(), receiver));
         // BRANCH: let the consumer park first
         thread::sleep(Duration::from_millis(150));
         sender.send(9).unwrap();
         let (value, _receiver) = consumer.join().unwrap();
         assert_eq!(value, 9);
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "the unpark did not cut the wait short"
-        );
+        assert!(start.elapsed() < Duration::from_secs(5), "the unpark did not cut the wait short");
     });
 }
 
@@ -232,12 +216,8 @@ fn one_wakeup_serves_many_senders() {
         });
         // BRANCH: the consumer parks, then eight producers send at once: all jobs arrive, none lost to the single claim
         thread::sleep(Duration::from_millis(100));
-        let handles: Vec<_> = senders
-            .into_iter()
-            .map(|mut sender| {
-                thread::spawn(move || (0..1_000).for_each(|i| sender.send(i).unwrap()))
-            })
-            .collect();
+        let handles: Vec<_> =
+            senders.into_iter().map(|mut sender| thread::spawn(move || (0..1_000).for_each(|i| sender.send(i).unwrap()))).collect();
         for handle in handles {
             handle.join().unwrap();
         }
@@ -313,12 +293,7 @@ fn recv_timeout_returns_timeout_when_empty() {
         let channel = GkTreiberChannel::<u64>::new();
         let _sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
-        assert_eq!(
-            receiver
-                .recv_timeout(Duration::from_millis(50))
-                .unwrap_err(),
-            GkTreiberChannelError::TIMEOUT
-        );
+        assert_eq!(receiver.recv_timeout(Duration::from_millis(50)).unwrap_err(), GkTreiberChannelError::TIMEOUT);
     });
 }
 
@@ -345,10 +320,7 @@ fn blocked_receiver_is_woken_by_the_last_sender_dropping() {
         let consumer = thread::spawn(move || receiver.recv().unwrap_err());
         thread::sleep(Duration::from_millis(150));
         drop(sender);
-        assert_eq!(
-            consumer.join().unwrap(),
-            GkTreiberChannelError::DISCONNECTED
-        );
+        assert_eq!(consumer.join().unwrap(), GkTreiberChannelError::DISCONNECTED);
     });
 }
 
@@ -365,10 +337,7 @@ fn sent_jobs_survive_the_sender_and_then_disconnect() {
         for i in 0..3 {
             assert_eq!(receiver.recv().unwrap(), i);
         }
-        assert_eq!(
-            receiver.recv().unwrap_err(),
-            GkTreiberChannelError::DISCONNECTED
-        );
+        assert_eq!(receiver.recv().unwrap_err(), GkTreiberChannelError::DISCONNECTED);
     });
 }
 
@@ -387,10 +356,7 @@ fn send_after_receiver_dropped_hands_the_value_back() {
 fn only_one_receiver() {
     let channel = GkTreiberChannel::<u64>::new();
     let _receiver = channel.receiver().unwrap();
-    assert_eq!(
-        channel.receiver().err(),
-        Some(GkTreiberChannelError::RECEIVER_TAKEN)
-    );
+    assert_eq!(channel.receiver().err(), Some(GkTreiberChannelError::RECEIVER_TAKEN));
 }
 
 #[test]
@@ -489,19 +455,11 @@ fn config_defaults_match_the_constants() {
 fn invalid_configs_are_rejected() {
     let base = GkTreiberChannelConfig::DEFAULT;
     // BRANCH: one case per rule
-    for config in [
-        base.with_bounded(true).with_slab_nodes(0),
-        base.with_grow_nodes(0),
-        base.with_return_batch(0),
-    ] {
-        assert_eq!(
-            GkTreiberChannel::<u64>::with_config(config).err(),
-            Some(GkTreiberChannelError::INVALID_CONFIG)
-        );
+    for config in [base.with_bounded(true).with_slab_nodes(0), base.with_grow_nodes(0), base.with_return_batch(0)] {
+        assert_eq!(GkTreiberChannel::<u64>::with_config(config).err(), Some(GkTreiberChannelError::INVALID_CONFIG));
     }
     // An unbounded sender without a slab grows on demand, one chunk at a time.
-    let channel =
-        GkTreiberChannel::<u64>::with_config(base.with_slab_nodes(0).with_grow_nodes(8)).unwrap();
+    let channel = GkTreiberChannel::<u64>::with_config(base.with_slab_nodes(0).with_grow_nodes(8)).unwrap();
     let mut sender = channel.sender().unwrap();
     let mut receiver = channel.receiver().unwrap();
     sender.send(1).unwrap();
@@ -512,9 +470,7 @@ fn invalid_configs_are_rejected() {
 #[test]
 fn custom_slab_bounds_the_sender() {
     within(10, || {
-        let config = GkTreiberChannelConfig::DEFAULT
-            .with_slab_nodes(8)
-            .with_bounded(true);
+        let config = GkTreiberChannelConfig::DEFAULT.with_slab_nodes(8).with_bounded(true);
         let channel = GkTreiberChannel::<u64>::with_config(config).unwrap();
         let mut sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
@@ -537,19 +493,13 @@ fn custom_slab_bounds_the_sender() {
 fn node_goes_home_while_the_receiver_still_owns_the_value() {
     within(10, || {
         let drops = Arc::new(AtomicUsize::new(0));
-        let config = GkTreiberChannelConfig::DEFAULT
-            .with_slab_nodes(2)
-            .with_return_batch(1)
-            .with_bounded(true);
+        let config = GkTreiberChannelConfig::DEFAULT.with_slab_nodes(2).with_return_batch(1).with_bounded(true);
         let channel = GkTreiberChannel::<Tracked>::with_config(config).unwrap();
         let mut sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
         sender.try_send(Tracked(drops.clone())).unwrap();
         sender.try_send(Tracked(drops.clone())).unwrap();
-        assert!(matches!(
-            sender.try_send(Tracked(drops.clone())),
-            Err(GkTrySendError::Full(_))
-        ));
+        assert!(matches!(sender.try_send(Tracked(drops.clone())), Err(GkTrySendError::Full(_))));
         // The full attempt's value was handed back and dropped here.
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         // BRANCH: the receiver keeps the value; its node is already free for the next send
@@ -568,10 +518,7 @@ fn node_goes_home_while_the_receiver_still_owns_the_value() {
 #[test]
 fn returns_are_flushed_when_the_receiver_runs_dry() {
     within(10, || {
-        let config = GkTreiberChannelConfig::DEFAULT
-            .with_slab_nodes(4)
-            .with_return_batch(1_000)
-            .with_bounded(true);
+        let config = GkTreiberChannelConfig::DEFAULT.with_slab_nodes(4).with_return_batch(1_000).with_bounded(true);
         let channel = GkTreiberChannel::<u64>::with_config(config).unwrap();
         let mut sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
@@ -590,15 +537,10 @@ fn returns_are_flushed_when_the_receiver_runs_dry() {
 /// Small enough for Miri: `cargo +nightly miri test --test treiber_channel small_`.
 #[test]
 fn small_channel_many_producers_and_endings() {
-    let config = GkTreiberChannelConfig::DEFAULT
-        .with_slab_nodes(4)
-        .with_grow_nodes(3)
-        .with_return_batch(3)
-        .with_spin_polls(2);
+    let config = GkTreiberChannelConfig::DEFAULT.with_slab_nodes(4).with_grow_nodes(3).with_return_batch(3).with_spin_polls(2);
     // BRANCH: bounded and unbounded, receiver dropped last and first
     for (bounded, receiver_first) in [(false, false), (true, false), (false, true)] {
-        let channel =
-            GkTreiberChannel::<Box<u64>>::with_config(config.with_bounded(bounded)).unwrap();
+        let channel = GkTreiberChannel::<Box<u64>>::with_config(config.with_bounded(bounded)).unwrap();
         let mut receiver = channel.receiver().unwrap();
         let handles: Vec<_> = (0..3u64)
             .map(|id| {
@@ -693,10 +635,7 @@ fn exactly_once_with_churn(config: GkTreiberChannelConfig, producers: u64, per: 
     let mut seen = vec![false; (producers * per) as usize];
     let mut count = 0;
     while let Ok(value) = receiver.recv() {
-        assert!(
-            !std::mem::replace(&mut seen[value as usize], true),
-            "duplicate {value}"
-        );
+        assert!(!std::mem::replace(&mut seen[value as usize], true), "duplicate {value}");
         count += 1;
     }
     for handle in handles {
@@ -707,53 +646,33 @@ fn exactly_once_with_churn(config: GkTreiberChannelConfig, producers: u64, per: 
 
 #[test]
 fn lifo_delivers_every_job_exactly_once() {
-    within(60, || {
-        exactly_once_with_churn(lifo().with_slab_nodes(64).with_grow_nodes(64), 4, 40_000)
-    });
+    within(60, || exactly_once_with_churn(lifo().with_slab_nodes(64).with_grow_nodes(64), 4, 40_000));
 }
 
 #[test]
 fn fifo_delivers_every_job_exactly_once_with_churn() {
-    within(60, || {
-        exactly_once_with_churn(
-            GkTreiberChannelConfig::DEFAULT
-                .with_slab_nodes(64)
-                .with_grow_nodes(64),
-            4,
-            40_000,
-        )
-    });
+    within(60, || exactly_once_with_churn(GkTreiberChannelConfig::DEFAULT.with_slab_nodes(64).with_grow_nodes(64), 4, 40_000));
 }
 
 #[test]
 fn many_senders_each_get_a_turn() {
     within(60, || {
         exactly_once_with_churn(lifo().with_slab_nodes(16).with_grow_nodes(16), 40, 2_000);
-        exactly_once_with_churn(
-            GkTreiberChannelConfig::DEFAULT
-                .with_slab_nodes(16)
-                .with_grow_nodes(16),
-            40,
-            2_000,
-        );
+        exactly_once_with_churn(GkTreiberChannelConfig::DEFAULT.with_slab_nodes(16).with_grow_nodes(16), 40, 2_000);
     });
 }
 
 #[test]
 fn lifo_receiver_times_out_and_is_woken_like_fifo() {
     within(10, || {
-        let channel =
-            GkTreiberChannel::<u64>::with_config(lifo().with_single_producer(true)).unwrap();
+        let channel = GkTreiberChannel::<u64>::with_config(lifo().with_single_producer(true)).unwrap();
         let mut sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
         // A short chain, then idle: the pacing must not keep the receiver from parking or timing out.
         sender.send(1).unwrap();
         assert_eq!(receiver.recv().unwrap(), 1);
         let start = Instant::now();
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_millis(30)),
-            Err(GkTreiberChannelError::TIMEOUT)
-        );
+        assert_eq!(receiver.recv_timeout(Duration::from_millis(30)), Err(GkTreiberChannelError::TIMEOUT));
         assert!(start.elapsed() >= Duration::from_millis(30));
         // Parked, then woken by a send.
         let producer = thread::spawn(move || {
@@ -772,9 +691,7 @@ fn lifo_single_producer_drops_every_payload_once() {
     within(10, || {
         let drops = Arc::new(AtomicUsize::new(0));
         {
-            let channel =
-                GkTreiberChannel::<Tracked>::with_config(lifo().with_single_producer(true))
-                    .unwrap();
+            let channel = GkTreiberChannel::<Tracked>::with_config(lifo().with_single_producer(true)).unwrap();
             let mut sender = channel.sender().unwrap();
             let mut receiver = channel.receiver().unwrap();
             for _ in 0..10 {
@@ -790,11 +707,7 @@ fn lifo_single_producer_drops_every_payload_once() {
 /// Small enough for Miri: lifo with senders coming and going, and both endings.
 #[test]
 fn small_lifo_channel_with_churn() {
-    let config = lifo()
-        .with_slab_nodes(4)
-        .with_grow_nodes(3)
-        .with_return_batch(3)
-        .with_spin_polls(2);
+    let config = lifo().with_slab_nodes(4).with_grow_nodes(3).with_return_batch(3).with_spin_polls(2);
     // BRANCH: receiver dropped last and first
     for receiver_first in [false, true] {
         let channel = GkTreiberChannel::<Box<u64>>::with_config(config).unwrap();
