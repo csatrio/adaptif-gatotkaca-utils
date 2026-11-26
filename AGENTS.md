@@ -298,22 +298,16 @@ about `rescue_after` so stalled chains get rescued. At shutdown, `drain` takes e
 
 ## Working on this crate
 
-- MSRV 1.85 (`rust-version`), edition 2024. Formatting: `rustfmt.toml` (140 columns, `use_small_heuristics = "Max"`,
-  Unix newlines), `.editorconfig` for other files, LF enforced by `.gitattributes`. rustfmt does not wrap comments or
-  strings: keep them within 140 columns by hand (Markdown within 120).
-- Before finishing:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-RUSTFLAGS="--cfg gk_loom" cargo clippy --all-targets -- -D warnings
-cargo test                                         # includes README.md and AGENTS.md examples
-RUSTFLAGS="--cfg gk_loom" cargo test --release --test loom_parking
-cargo +nightly miri test --test treiber_parking --test treiber_publish --test treiber_iterator
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo +1.85 check --all-targets
-cargo publish --dry-run
-```
+- MSRV 1.85 (`rust-version`), edition 2024. Formatting: `rustfmt.toml` (edition 2024, 140 columns,
+  `use_small_heuristics = "Max"`, the same file as gatotkaca-python), `.editorconfig` for other files, LF enforced by
+  `.gitattributes`. rustfmt does not wrap comments or strings: keep them within 140 columns by hand (Markdown within 120).
+- Tasks live in the `Justfile` (install `just`; run `just --list`). Run `just` recipes, not the raw cargo commands:
+  - `just fmt` formats; `just check` is the fast gate (fmt check, clippy with and without `gk_loom`).
+  - `just test`, `just loom`, `just doc`, `just msrv` (needs the 1.85 toolchain), `just publish-dry`, `just bench-rust`.
+  - `just miri` (nightly) is kept out of `verify` because it is slow; run it when you touch the atomic protocols.
+  - `just verify` is the single gate before declaring work done: `check test loom doc msrv publish-dry`. Run `just miri`
+    as well for changes to the parking, publish or iterator code.
+  - Recipes set `RUSTC_WRAPPER=sccache` and `mold` only when installed; loom and miri use their own `CARGO_TARGET_DIR`.
 
 - New atomic protocol code: put a loom model in `tests/` and, if it needs loom atomics inside the crate, import them
   through the `cfg(gk_loom)` switch (as `src/treiber_parking.rs` does), never `cfg(loom)` (dependencies react to it).
