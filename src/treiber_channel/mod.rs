@@ -29,9 +29,16 @@
 //! `unpark`, so a sleeping receiver is woken once, not once per send. The waker is handed back after the unpark and
 //! reused by the next sleep, so sleeping does not allocate.
 //!
-//! A send publishes its node with a `SeqCst` compare-and-swap and then reads the waiter with a `SeqCst` load; the
-//! receiver publishes the waiter, runs a `SeqCst` fence and polls. Either the producer sees the waiter or the receiver
-//! sees the job, and the send pays for no separate fence.
+//! Whether the receiver sleeps is kept in the outboxes themselves, as in [`GkParkingStack`](crate::GkParkingStack): an
+//! outbox head is a parked marker, null or the newest job. A send is one `Release` compare-and-swap and reads nothing
+//! else; only the send that replaces the marker runs a `SeqCst` fence and tries to claim the waiter. Before sleeping,
+//! the receiver publishes the waiter, runs a `SeqCst` fence and marks every empty outbox parked, and stays awake if one
+//! holds jobs. Either the producer's claim sees the waiter or the receiver's marking sees the job.
+//!
+//! The markers stay when the receiver wakes up, so an idle sender's outbox stays parked and costs the next sleep
+//! nothing; only outboxes that received jobs since the last sleep are marked again. A sender's first push after a sleep
+//! therefore runs the fence and finds the waiter already claimed or never published, at most once per sleep. A new
+//! sender's outbox starts parked, so a receiver that sleeps before it has seen the sender is still woken.
 //!
 //! The receiver works in laps over its senders: it takes one sender's outbox with one atomic swap (an empty outbox
 //! costs only a load), reverses the chain (FIFO per producer), hands it out to the end and moves on to the next sender.
@@ -398,24 +405,57 @@ fn orphan<T, M: GkChannelMemory>() -> *mut GkJobNode<T, M> {
     ptr::without_provenance_mut(1)
 }
 
-/// Pushes a filled node onto an outbox and publishes it with a `SeqCst` compare-and-swap. `SeqCst` (instead of
-/// `Release`) lets the following waiter check in [`GkShared::wake_if_parked`] go without a separate fence.
+/// The outbox head while the receiver sleeps, or has slept since the owner last pushed: the next push must wake it. A
+/// state, not a node (never dereferenced, never linked): nodes are aligned and this is 1. See "Waking the receiver" in
+/// the module docs.
+#[inline(always)]
+fn parked<T, M: GkChannelMemory>() -> *mut GkJobNode<T, M> {
+    ptr::without_provenance_mut(1)
+}
+
+/// Pushes a filled node onto an outbox and publishes it with a `Release` compare-and-swap. Returns true if it replaced
+/// the parked marker: the receiver may be asleep, and the caller must call [`GkShared::wake_parked`].
+///
+/// The marker shares the head with the jobs, so the push needs no second look at shared state, and no `SeqCst`.
 ///
 /// # Safety
 /// `node` must be valid, owned by the caller and in no stack; `outbox` must belong to the caller's thread channel.
 #[inline(always)]
-unsafe fn submit<T, M: GkChannelMemory>(outbox: &AtomicPtr<GkJobNode<T, M>>, node: *mut GkJobNode<T, M>) {
+unsafe fn submit<T, M: GkChannelMemory>(outbox: &AtomicPtr<GkJobNode<T, M>>, node: *mut GkJobNode<T, M>) -> bool {
     let mut head = outbox.load(Ordering::Relaxed);
     loop {
+        // The marker is a state, not a node: the chain ends at null.
+        let link = if head == parked() { ptr::null_mut() } else { head };
         // Safety: the node is ours until the CAS publishes it.
-        unsafe { (*node).next.store(head, Ordering::Relaxed) };
-        match outbox.compare_exchange_weak(head, node, Ordering::SeqCst, Ordering::Relaxed) {
+        unsafe { (*node).next.store(link, Ordering::Relaxed) };
+        // Release: the receiver's Acquire swap sees the payload and the link (every push is a read-modify-write of the
+        // head, so all of them are in one release sequence).
+        match outbox.compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed) {
             // BRANCH: published
-            Ok(_) => return,
-            // BRANCH: the receiver took the chain meanwhile (only it competes with the owner), retry on the new head
+            Ok(_) => return head == parked(),
+            // BRANCH: the receiver took the chain or marked the outbox meanwhile (only it competes with the owner)
             Err(current) => head = current,
         }
     }
+}
+
+/// Takes every job in an outbox, newest first, and leaves it null; null if there is none. A parked marker stays: the
+/// outbox holds no job, and its owner's next push still wakes the receiver.
+///
+/// # Safety
+/// Only the receiver, or a dropping sender once the receiver is gone, may take an outbox.
+#[inline(always)]
+unsafe fn take_outbox<T, M: GkChannelMemory>(outbox: &AtomicPtr<GkJobNode<T, M>>) -> *mut GkJobNode<T, M> {
+    let head = outbox.load(Ordering::Relaxed);
+    // BRANCH: nothing submitted, which costs a load and leaves the line with its owner
+    if head.is_null() || head == parked() {
+        return ptr::null_mut();
+    }
+    // Acquire pairs with the pushes' Release compare-and-swap.
+    let taken = outbox.swap(ptr::null_mut(), Ordering::Acquire);
+    // Only the receiver marks an outbox, and it is not marking while it takes.
+    debug_assert!(taken != parked(), "an outbox was marked while it was taken");
+    taken
 }
 
 /// Sends `count` empty nodes of `channel`, linked `first -> ... -> last`, home with one compare-and-swap.
@@ -585,7 +625,8 @@ unsafe fn free_slab<T, M: GkChannelMemory>(memory: &M, slab: *mut GkJobNode<T, M
 unsafe fn drain_outbox<T, M: GkChannelMemory>(channel: *const GkThreadChannel<T, M>) {
     // Safety: the outbox is valid; reaping gives this thread the whole chain.
     let outbox = unsafe { &(*channel).outbox };
-    let first = outbox.head.reap_all().into_inner();
+    // Safety: called by the receiver (retiring the channel) or by the owner once the receiver is gone.
+    let first = unsafe { take_outbox(&outbox.head) };
     // BRANCH: nothing submitted
     if first.is_null() {
         return;
@@ -646,7 +687,20 @@ struct GkShared<T, W: GkWaker, M: GkChannelMemory> {
 }
 
 impl<T, W: GkWaker, M: GkChannelMemory> GkShared<T, W, M> {
-    /// Wakes the receiver if it is parked. Call right after a `SeqCst` publish of the change it must see.
+    /// Wakes the receiver after a push replaced the parked marker of an outbox. The receiver may be asleep, about to
+    /// sleep, or awake with the marker left over from an earlier sleep (then the waiter is null and nothing happens).
+    #[cold]
+    #[inline(never)]
+    fn wake_parked(&self) {
+        // SeqCst: pairs with the receiver's fence between publishing its waker and marking the outboxes. If the
+        // receiver's fence comes first, the load in `wake` sees the waker; if ours does, the receiver's look at this
+        // outbox (or at the registry, for a sender it has not seen yet) sees the push and it does not sleep.
+        fence(Ordering::SeqCst);
+        self.wake();
+    }
+
+    /// Wakes the receiver if it is parked. Call right after a `SeqCst` publish of the change it must see (a dropping
+    /// sender's `senders` decrement; jobs use [`wake_parked`](Self::wake_parked)).
     #[inline(always)]
     fn wake_if_parked(&self) {
         // SeqCst: with the caller's SeqCst publish, either this load sees the waiter or the receiver's poll (after its
@@ -660,12 +714,18 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkShared<T, W, M> {
     #[cold]
     #[inline(never)]
     fn wake(&self) {
-        // Claim the waiter: only the producer that swaps it out unparks, so a parked receiver costs one wakeup, not one
+        // Look before claiming: a receiver that is awake (a marker left from an earlier sleep) or already claimed costs
+        // a load, not a write to a line every producer reads.
+        let waiter = self.waiter.load(Ordering::Relaxed);
+        // BRANCH: nobody is waiting
+        if waiter.is_null() {
+            return;
+        }
+        // Claim the waiter: only the producer that takes it out unparks, so a parked receiver costs one wakeup, not one
         // per send. Acquire: the receiver's `prepare` / `register` must be visible before `unpark` reads the waker.
-        let waiter = self.waiter.swap(ptr::null_mut(), Ordering::Acquire);
         // BRANCH: another producer (or the receiver itself) claimed it first
-        if !waiter.is_null() {
-            // Safety: the swap gave this thread the only claim on the receiver's waker; `unpark` takes `&self`.
+        if self.waiter.compare_exchange(waiter, ptr::null_mut(), Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            // Safety: the claim gave this thread the only pointer to the receiver's waker; `unpark` takes `&self`.
             unsafe { (*waiter).unpark() };
             self.stash(waiter);
         }
@@ -863,7 +923,9 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkTreiberChannel<T, W, M> {
         let channel = alloc_slab::<T, M>(memory, nodes).and_then(|slab| {
             let channel = GkThreadChannel {
                 inbox: CachePadded::new(AtomicPtr::new(ptr::null_mut())),
-                outbox: CachePadded::new(GkOutbox { head: AtomicPtr::new(ptr::null_mut()), gone: AtomicBool::new(false) }),
+                // Parked from the start: the receiver may be asleep before it has ever seen this sender, so the first
+                // push must wake it.
+                outbox: CachePadded::new(GkOutbox { head: AtomicPtr::new(parked()), gone: AtomicBool::new(false) }),
                 registry_next: AtomicPtr::new(ptr::null_mut()),
                 pending: AtomicIsize::new(0),
                 slab,
@@ -1012,9 +1074,11 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkSender<T, W, M> {
         unsafe {
             (*node).payload.write(value);
             let outbox = &(*self.channel).outbox;
-            submit(&outbox.head, node);
+            // BRANCH: the push replaced the parked marker, once per sleep of the receiver
+            if submit(&outbox.head, node) {
+                self.shared.wake_parked();
+            }
         }
-        self.shared.wake_if_parked();
         Ok(())
     }
 
@@ -1331,14 +1395,14 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(GkTreiberChannelError::TIMEOUT);
             }
-            // Park: publish the waker, then look once more, so a producer either sees the waker or we see its job.
+            // Park: publish the waker, then mark the outboxes, so a producer either sees the waker or we see its job.
             // BRANCH: jobs arrived while waiting for the waker to come back
             let Some(waker) = self.announce(W::prepare) else {
                 continue;
             };
             fence(Ordering::SeqCst);
             // BRANCH: a job or a disconnect arrived while announcing
-            if self.poll() || self.shared.senders.load(Ordering::Acquire) == 0 {
+            if self.mark_parked() || self.shared.senders.load(Ordering::Acquire) == 0 {
                 self.retract();
                 continue;
             }
@@ -1371,7 +1435,8 @@ impl<T: Send, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
         };
         // Safety: the swap gave this receiver the only pointer to the waker.
         prepare(unsafe { &mut *waker });
-        // SeqCst: part of the waiter / job handshake (see `GkShared::wake_if_parked`).
+        // SeqCst: part of the disconnect handshake (see `GkShared::wake_if_parked`); the job handshake relies on the
+        // caller's fence that follows (see `GkShared::wake_parked`).
         self.shared.waiter.store(waker, Ordering::SeqCst);
         Some(waker)
     }
@@ -1399,14 +1464,14 @@ impl<T: Send, W: GkAsyncWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 }
                 return Poll::Ready(Err(GkTreiberChannelError::DISCONNECTED));
             }
-            // Register the task, publish, look once more: a producer either sees the waker or we see its job.
+            // Register the task, publish, mark the outboxes: a producer either sees the waker or we see its job.
             // BRANCH: jobs arrived while waiting for the waker to come back
             if self.announce(|waker| waker.register(cx.waker())).is_none() {
                 continue;
             }
             fence(Ordering::SeqCst);
             // BRANCH: a job or a disconnect arrived while registering
-            if self.poll() || self.shared.senders.load(Ordering::Acquire) == 0 {
+            if self.mark_parked() || self.shared.senders.load(Ordering::Acquire) == 0 {
                 self.retract();
                 continue;
             }
@@ -1532,13 +1597,13 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
             let (next, taken, retired) = unsafe {
                 let next = (*channel).registry_next.load(Ordering::Relaxed);
                 let outbox = &(*channel).outbox;
-                let mut taken = outbox.head.reap_all().into_inner();
+                let mut taken = take_outbox(&outbox.head);
                 // Only an empty outbox needs the owner check (same cache line as the head). If the owner is gone, its
                 // last push happened before the flag, so one more reap takes everything that will ever come.
                 // BRANCH: the owner is gone and the outbox is empty for good
                 let retired = taken.is_null() && outbox.gone.load(Ordering::Acquire);
                 if retired {
-                    taken = outbox.head.reap_all().into_inner();
+                    taken = take_outbox(&outbox.head);
                 }
                 (next, taken, retired)
             };
@@ -1565,6 +1630,38 @@ impl<T, W: GkWaker, M: GkChannelMemory> GkReceiver<T, W, M> {
                 return true;
             }
         }
+    }
+
+    /// Marks every empty outbox parked, before sleeping: the next push into it wakes the receiver. Call after publishing
+    /// the waker and a `SeqCst` fence, right after a `poll` that found nothing. Returns true, without sleeping, if an
+    /// outbox holds jobs. An outbox that is still parked from an earlier sleep is left as it is (its owner has not
+    /// pushed since), so idle senders cost nothing here; only those that pushed since the last sleep take a CAS.
+    #[cold]
+    fn mark_parked(&mut self) -> bool {
+        // The lap is over (a false `poll`), so the private list can change at its front.
+        debug_assert!(self.head.is_null() && self.cursor.is_null());
+        // Senders registered after the fence start parked; those registered before it are absorbed here.
+        self.absorb_registry();
+        let mut channel = self.channels;
+        // BRANCH: one iteration per known sender
+        while !channel.is_null() {
+            // Safety: registered channels are valid until the receiver releases them, which only `poll` does.
+            let outbox = unsafe { &(*channel).outbox };
+            let head = &outbox.head;
+            let current = head.load(Ordering::Relaxed);
+            // Relaxed: the fences order the marking against the pushes (see `GkShared::wake_parked`).
+            // BRANCH: an empty outbox, marked unless a push lands first; a parked one is skipped; jobs stop the sleep
+            if current.is_null() {
+                if head.compare_exchange(ptr::null_mut(), parked(), Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                    return true;
+                }
+            } else if current != parked() {
+                return true;
+            }
+            // Safety: as above.
+            channel = unsafe { (*channel).registry_next.load(Ordering::Relaxed) };
+        }
+        false
     }
 
     /// Moves newly registered thread channels to the front of the private list.

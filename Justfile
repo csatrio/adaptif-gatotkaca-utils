@@ -16,9 +16,10 @@ check:
 test:
     cargo test
 
-# Loom models of the parking types and the consumer protocol (separate target dir: the cfg changes every crate's build)
+# Loom models of the parking types, the consumer protocol and the channel's parked outboxes (separate target dir: the
+# cfg changes every crate's build)
 loom:
-    CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg gk_loom" cargo test --release --test loom_parking
+    CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg gk_loom" cargo test --release --test loom_parking --test loom_channel_park
 
 # Miri (nightly) on the Treiber suites: UB, data races, leaks. Shrink workloads under cfg(miri), not here.
 miri:

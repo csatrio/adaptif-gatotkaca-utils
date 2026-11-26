@@ -9,7 +9,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
         mpsc,
     },
     thread,
@@ -483,16 +483,32 @@ fn exactly_once_with_short_lived_workers() {
     });
 }
 
-/// A pool-style handshake: a worker announces itself asleep with a `SeqCst` RMW on the state word, re-checks
-/// `has_work` and only then waits; a producer pushes, then does a `SeqCst` RMW on the same word and wakes a worker if
-/// any is asleep. While chains are shared, a worker parks with a timeout, to rescue one that stalls. Small bursts keep
-/// the workers parking all the time. A lost wake-up hangs, and the test times out.
+/// The module docs' handshake: a worker announces itself asleep on the state word, runs a `SeqCst` fence, re-checks
+/// `has_work` and only then waits; a producer pushes, runs a `SeqCst` fence, loads the word and wakes a worker if any
+/// is asleep. While chains are shared, a worker parks with a timeout, to rescue one that stalls. Small bursts keep the
+/// workers parking all the time. A lost wake-up hangs, and the test times out.
 #[test]
 fn no_lost_wakeups_with_pool_handshake() {
+    pool_handshake(Handshake::Fence);
+}
+
+/// The same with the alternative handshake: a `SeqCst` read-modify-write on the state word on both sides.
+#[test]
+fn no_lost_wakeups_with_rmw_pool_handshake() {
+    pool_handshake(Handshake::Rmw);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Handshake {
+    Fence,
+    Rmw,
+}
+
+fn pool_handshake(handshake: Handshake) {
     const PRODUCERS: usize = 3;
     const PER: u64 = if cfg!(miri) { 200 } else { 30_000 };
     const WORKERS: usize = 6;
-    within(120, || {
+    within(120, move || {
         struct Pool {
             queue: GkTreiberMpmc<Job>,
             sleepers: AtomicUsize,
@@ -500,11 +516,19 @@ fn no_lost_wakeups_with_pool_handshake() {
             wake: Condvar,
             done: AtomicBool,
             taken: AtomicU64,
+            handshake: Handshake,
         }
         impl Pool {
             fn notify(&self) {
+                // BRANCH: the handshake under test
+                let sleepers = if self.handshake == Handshake::Fence {
+                    fence(Ordering::SeqCst);
+                    self.sleepers.load(Ordering::Relaxed)
+                } else {
+                    self.sleepers.fetch_add(0, Ordering::SeqCst)
+                };
                 // BRANCH: someone is (about to be) asleep
-                if self.sleepers.fetch_add(0, Ordering::SeqCst) > 0 {
+                if sleepers > 0 {
                     let _guard = self.lock.lock().unwrap();
                     self.wake.notify_one();
                 }
@@ -517,6 +541,7 @@ fn no_lost_wakeups_with_pool_handshake() {
             wake: Condvar::new(),
             done: AtomicBool::new(false),
             taken: AtomicU64::new(0),
+            handshake,
         });
         let workers: Vec<_> = (0..WORKERS)
             .map(|_| {
@@ -533,6 +558,10 @@ fn no_lost_wakeups_with_pool_handshake() {
                         }
                         let guard = pool.lock.lock().unwrap();
                         pool.sleepers.fetch_add(1, Ordering::SeqCst);
+                        // BRANCH: the fence handshake pairs this fence with the producer's
+                        if pool.handshake == Handshake::Fence {
+                            fence(Ordering::SeqCst);
+                        }
                         // BRANCH: the last re-check before parking
                         if pool.queue.has_work() {
                             pool.sleepers.fetch_sub(1, Ordering::SeqCst);

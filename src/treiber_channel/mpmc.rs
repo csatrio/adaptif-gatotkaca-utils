@@ -54,10 +54,17 @@
 //! # Waking workers
 //!
 //! The queue never parks a worker; the pool decides who sleeps and who wakes. [`GkMpmcLane::push`] publishes the job
-//! with a `SeqCst` compare-and-swap before it returns. When the producer follows with a `SeqCst` read-modify-write on
-//! the pool's state word, and a worker about to park does its own `SeqCst` read-modify-write on that word before
-//! calling [`has_work`](GkTreiberMpmc::has_work), either the producer sees the worker going to sleep or the worker's
-//! `has_work` sees the job.
+//! with a `SeqCst` compare-and-swap before it returns. Pair it with fences:
+//!
+//! - producer: `push`, then `fence(SeqCst)`, then a relaxed load of the pool's state word (how many workers sleep);
+//!   wake one if any;
+//! - worker about to park: record itself in the state word (any store or read-modify-write), then `fence(SeqCst)`,
+//!   then [`has_work`](GkTreiberMpmc::has_work); park only if it is `false`.
+//!
+//! Whichever fence comes first, the load after the other one sees the write before the first: either the producer sees
+//! the worker going to sleep or the worker's `has_work` sees the job. A `SeqCst` read-modify-write on the state word
+//! on both sides (in place of the fence and the load) works too, but it writes the word's cache line on every push:
+//! with 2 or 4 producers it measured 15 to 25% slower (`bench_mpmc_parking` in `tests/bench_treiber_mpmc.rs`).
 //!
 //! `has_work` looks at the lanes only: a shared chain has an owner working on it, so idle workers may park. But nothing
 //! signals when that owner blocks, so while [`shared_chains`](GkTreiberMpmc::shared_chains) is above 0 a worker must
@@ -1070,7 +1077,7 @@ impl<N: TreiberNode, M: GkChannelMemory> GkMpmcLane<N, M> {
         loop {
             // Safety: the job is ours until the CAS publishes it.
             unsafe { (*job).next().store(head, Ordering::Relaxed) };
-            // SeqCst: publishes the job and orders it before the pool's SeqCst state update.
+            // SeqCst: publishes the job and orders it before the pool's SeqCst fence (or state update).
             match lane.pending.compare_exchange_weak(head, job, Ordering::SeqCst, Ordering::Relaxed) {
                 // BRANCH: published
                 Ok(_) => return,

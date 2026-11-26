@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.17.0
+
+- `GkTreiberChannel` keeps the receiver's sleep in the outbox heads, as `GkParkingStack` does: before it sleeps, the
+  receiver marks every empty outbox parked (a sentinel address, never a node), and a send is one `Release`
+  compare-and-swap that reads no other shared state. Only the send that replaces a marker runs a `SeqCst` fence and
+  looks for the sleeping receiver. Before, every send used a `SeqCst` compare-and-swap followed by a `SeqCst` load of
+  the waiter. Markers stay from one sleep to the next, so idle senders cost nothing per sleep; a new sender's outbox
+  starts parked, so its first send wakes a receiver that has not seen it yet. One producer, M msgs/s against 0.16 on
+  an Apple M3: unbounded 261 to 276, 1:1 264 to 280, bounded 80 to 126, lifo 102 to 332. With 2 to 6 producers FIFO
+  and bounded are unchanged (within 2%) and lifo is 1 to 2.5% lower; ping-pong latency is unchanged.
+- The waker hand-off reads the waiter before claiming it with a compare-and-swap, so producers that find no sleeping
+  receiver write nothing.
+- Tests for parked markers: the receiver is woken whichever sender sends, a sender created while the receiver sleeps
+  wakes it, and frequent parking loses no job (FIFO, lifo, no spin). A loom model of the handshake
+  (`tests/loom_channel_park.rs`, part of `just loom`) covers fresh markers, markers left from an earlier sleep and a
+  late sender, and checks that an `Acquire` fence in place of the `SeqCst` one loses a wake-up.
+- `bench_mpmc_parking` in `tests/bench_treiber_mpmc.rs`: a pool that parks its workers around `GkTreiberMpmc`, with
+  two producer-side handshakes (a `SeqCst` read-modify-write on the pool's state word, or a `SeqCst` fence and a
+  relaxed load) against crossbeam channel workers. The fence handshake is 15 to 25% faster with 2 or 4 producers; a
+  variant with no handshake at all measured within noise of it, so `GkTreiberMpmc` keeps its API.
+- `GkTreiberMpmc`'s module docs and the README now recommend the fence handshake for waking parked workers (producer:
+  push, `fence(SeqCst)`, relaxed load of the pool's state word; worker: record itself, `fence(SeqCst)`, `has_work`),
+  with the `SeqCst` read-modify-write as the slower alternative. The pool handshake stress test runs both.
+- `returns_are_flushed_when_the_receiver_runs_dry` runs 40 rounds under Miri (1 000 overran its time bound there).
+
 ## 0.16.0
 
 - `AGENTS.md`, shipped in the package: a guide for coding agents using the crate (which type to pick, recipes,

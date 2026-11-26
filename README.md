@@ -18,7 +18,7 @@ developed by [PT Adaptif Sinergi Dinamis](https://adaptif.co.id/).
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-utils = "0.16"
+adaptif-gatotkaca-utils = "0.17"
 ```
 
 The crate re-exports its dependencies, `crossbeam_utils` and `nohash_hasher`,
@@ -532,14 +532,15 @@ the receiver, and `try_send` returns `GkTrySendError::Full`. An unbounded sender
 chunk of `GK_GROW_NODES` (4096) nodes in one allocation and keeps it until it is dropped; `GkSender::shrink()` frees the
 chunks whose nodes are all back home. `GkTreiberChannel::with_config(GkTreiberChannelConfig)` sets the slab size, chunk
 size, receiver spin, return batch, bound, `single_producer` (a 1:1 channel) and `lifo`; every field defaults to its
-`GK_*` constant. The receiver spins briefly, then sleeps; the first producer to find it asleep wakes it. Memory: about
-65 KiB per sender while idle (4096 16-byte nodes), 15.7 bytes per queued `u64` against crossbeam's 16.3.
+`GK_*` constant. The receiver spins briefly, then sleeps; the first producer to find it asleep wakes it. Whether it
+sleeps is kept in the outbox heads (a parked marker, as in `GkParkingStack`), so a send is one `Release`
+compare-and-swap and reads no other shared state; only the send that replaces a marker looks for the sleeping
+receiver. Memory: about 65 KiB per sender while idle (4096 16-byte nodes), 15.7 bytes per queued `u64` against crossbeam's 16.3.
 
 `lifo` is for work that needs no ordering: the receiver skips the reverse that makes each producer's chain oldest-first
-and hands it out newest-first. With two or more producers that is the fastest mode (see the benchmark). A `lifo`
+and hands it out newest-first. That is the fastest mode with any number of producers (see the benchmark). A `lifo`
 receiver that catches up with its producers paces its next take with a bounded `Backoff::spin` (under a microsecond),
-so batches build up instead of a cache-line tug of war; idle receivers never wait, so latency is unchanged. With one
-producer FIFO is still faster, because the reverse keeps the receiver behind the producer for free.
+so batches build up instead of a cache-line tug of war; idle receivers never wait, so latency is unchanged.
 
 Need more throughput? Raise `slab_nodes` (`GkTreiberChannelConfig::DEFAULT.with_slab_nodes(65_536)`): each sender then
 has more jobs in flight before it waits or grows, at the cost of memory per sender.
@@ -555,25 +556,29 @@ Two hooks, both type parameters with defaults (`GkTreiberChannel<T, W = GkThread
 ### Benchmark
 
 Throughput in millions of `u64` messages per second, with the default configuration (4096-node slab, 4096-node growth
-chunks), 500,000 messages per producer, one receiver draining until every sender is gone, median of 5 runs. Measured on
+chunks), 500,000 messages per producer, one receiver draining until every sender is gone; each cell is the median of 4
+runs that each take the median of 5. Measured on
 an Apple M3 (4 performance + 4 efficiency cores), so from 4 producers up some threads run on efficiency cores.
 
 | Producers | treiber | treiber 1:1 | treiber bounded | treiber lifo | crossbeam unbounded | crossbeam bounded(4096) | std mpsc |
 |---|---|---|---|---|---|---|---|
-| 1 | 264 | 237 | 85 | 101 | 97 | 95 | 108 |
-| 2 | 286 | – | 202 | 454 | 127 | 121 | 43 |
-| 3 | 285 | – | 215 | 447 | 131 | 68 | 50 |
-| 4 | 280 | – | 219 | 446 | 128 | 52 | 12 |
-| 5 | 277 | – | 217 | 444 | 125 | 38 | 17 |
-| 6 | 281 | – | 217 | 429 | 116 | 19 | 16 |
+| 1 | 276 | 280 | 126 | 332 | 99 | 110 | 107 |
+| 2 | 284 | – | 206 | 450 | 119 | 130 | 46 |
+| 3 | 276 | – | 212 | 434 | 126 | 77 | 49 |
+| 4 | 271 | – | 213 | 417 | 127 | 54 | 13 |
+| 5 | 267 | – | 215 | 409 | 123 | 40 | 18 |
+| 6 | 267 | – | 216 | 409 | 111 | 23 | 16 |
 
 - `treiber`: `GkTreiberChannel::new()` (unbounded). `treiber 1:1`: `single_producer`, measured with one producer only.
   `treiber bounded`: `new_bounded()`, 4096 jobs per sender; crossbeam's bound of 4096 is for the whole channel.
   `treiber lifo`: `with_lifo(true)`, unbounded.
-- The 1-producer rows vary most between runs (the unbounded treiber measured 107 to 264 in back-to-back runs, the
-  bounded one 85 to 157).
-- Ping-pong round trip (send one value, wait for the echo), in microseconds: treiber p50 0.2 / p99 0.4 (1:1 0.3 / 0.4,
-  lifo 0.2 / 0.4), crossbeam unbounded 0.2 / 0.8, crossbeam bounded 0.2 / 0.2, std mpsc 1.9 / 3.9.
+- Parked markers (0.17) mostly help one producer, whose sends used to pay a `SeqCst` compare-and-swap and a `SeqCst`
+  load of the waiter. Against 0.16 in alternating runs on the same machine: treiber 261 to 276, 1:1 264 to 280,
+  bounded 80 to 126, lifo 102 to 332. With 2 to 6 producers FIFO and bounded are unchanged (within 2%) and lifo is
+  1 to 2.5% lower. The 1-producer rows are also steadier: 274 to 282 across runs, where 0.16 measured 107 to 264.
+- Ping-pong round trip (send one value, wait for the echo), in microseconds: treiber p50 0.3 / p99 0.4 (1:1 0.4 / 0.4,
+  lifo 0.2 / 0.4, unchanged by parked markers), crossbeam unbounded 0.2 / 0.8, crossbeam bounded 0.2 / 0.2, std mpsc
+  1.9 / 3.9.
 - A bigger slab is faster: with `slab_nodes(65_536)`, bounded treiber measured 232 to 274 across 1 to 6 producers.
 
 The tests in `tests/treiber_channel*.rs` cover ordering, wakeups, bounds, drops and leaks. The measurements
@@ -598,8 +603,10 @@ registration and no state of its own, and runs the chain it gets.
   `rescue_after / 2`. Each `GkMpmcChain` yields the jobs of one reap, oldest first; dropping it never loses a job.
 - **Unbounded.** `push` never fails, waits or allocates.
 - **No parking inside.** The pool decides who sleeps. `push` publishes the job with a `SeqCst` compare-and-swap before
-  it returns; pair it with a `SeqCst` read-modify-write on the pool's state word, and have a worker do its own before
-  its last `has_work()` re-check (one load per lane), and no wake-up is lost. Shared chains have owners, so they do not
+  it returns; follow it with `fence(SeqCst)` and a relaxed load of the pool's state word, and have a worker record
+  itself in that word and run `fence(SeqCst)` before its last `has_work()` re-check (one load per lane), and no
+  wake-up is lost. A `SeqCst` read-modify-write on the word on both sides works too, but measured 15 to 25% slower
+  with 2 or 4 producers (see the parking pool benchmark below). Shared chains have owners, so they do not
   count as work; but nothing signals when an owner blocks, so while `shared_chains() > 0` a worker should park with a
   timeout of about `rescue_after`.
 - **Ranking and fairness.** Each push stores the lane's push count (one relaxed store) and each reap adds the chain
@@ -681,6 +688,25 @@ The rescue delay costs the jobs behind a blocked worker about `rescue_after` (tr
 table); sharing chains costs some throughput against `reap-only` on empty jobs, mostly from rescues of owners the OS
 descheduled (these spinning benchmark workers are never parked). Treiber's empty-job numbers vary about ±20% between
 runs. At 8 workers the machine is oversubscribed (8 workers plus the producers on 8 cores).
+
+A pool that parks its workers, as the "No parking inside" item describes (`bench_mpmc_parking`): workers spin briefly,
+then announce themselves on the pool's state word, re-check `has_work()` and park; a producer checks the state word
+after each push and unparks one sleeper. `rmw` checks with a `SeqCst` `fetch_add(0)`; `fence` with
+`fence(SeqCst)` and a relaxed load (the worker runs a `SeqCst` fence after announcing). `cb channel` workers block in
+`recv`. Empty jobs, millions per second, median of 3 runs that each take the median of 5:
+
+| P × C | rmw | fence | cb channel |
+| --- | --- | --- | --- |
+| 1 × 2 | 6.9 | 6.8 | 7.3 |
+| 1 × 4 | 5.2 | 5.1 | 5.3 |
+| 2 × 4 | 14.3 | 16.9 | 5.3 |
+| 4 × 4 | 17.3 | 21.7 | 5.6 |
+
+Bursts of 16 jobs, 50 µs apart, push-to-run latency p50 / p99 in µs, for `rmw`, `fence` and `cb channel`: 1 × 2 about
+5.1 / 6.5 for all three; 2 × 4 4.4 / 6.4, 4.5 / 6.4, 4.0 / 6.1; 4 × 4 6.2 / 10.1, 6.1 / 10.4, 7.7 / 71. Latency is
+the wake-up itself (`unpark` to running, 4 to 6 µs); the handshake changes only throughput. A temporary variant with
+no fence at all (relaxed load, workers parking with a 1 ms timeout to survive lost wake-ups) measured within run
+noise of `fence`, so a lane-level parked marker, as in `GkParkingStack`, would save little more.
 
 The tests are in `tests/treiber_mpmc.rs` (they also run under Miri); the measurements are
 `cargo test --release --test bench_treiber_mpmc -- --ignored --nocapture --test-threads 1`.

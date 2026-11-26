@@ -522,7 +522,9 @@ fn returns_are_flushed_when_the_receiver_runs_dry() {
         let channel = GkTreiberChannel::<u64>::with_config(config).unwrap();
         let mut sender = channel.sender().unwrap();
         let mut receiver = channel.receiver().unwrap();
-        for round in 0..1_000u64 {
+        // Miri's clock counts interpreted steps: 1 000 rounds overrun the bound there.
+        let rounds = if cfg!(miri) { 40 } else { 1_000u64 };
+        for round in 0..rounds {
             // BRANCH: fill the bound, then drain it; a batch larger than the bound must still come home
             for i in 0..4 {
                 sender.try_send(round * 4 + i).unwrap();
@@ -761,4 +763,95 @@ fn small_lifo_channel_with_churn() {
             drop(receiver);
         }
     }
+}
+
+// ==== Parked markers ====
+
+/// Each sleep marks only the outboxes that received jobs since the last one; the others stay parked from earlier
+/// sleeps. Senders take turns sending one job to a receiver that has gone back to sleep each time, so every send lands
+/// on a marker of a different age.
+#[test]
+fn parked_markers_wake_the_receiver_whichever_sender_sends() {
+    within(30, || {
+        let channel = GkTreiberChannel::<u64>::new();
+        let mut receiver = channel.receiver().unwrap();
+        let mut senders: Vec<_> = (0..4).map(|_| channel.sender().unwrap()).collect();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let consumer = thread::spawn(move || {
+            while let Ok(value) = receiver.recv() {
+                ack_tx.send(value).unwrap();
+            }
+        });
+        let rounds = if cfg!(miri) { 8 } else { 100 };
+        for round in 0..rounds {
+            // BRANCH: let the receiver spin out and park before the next send
+            thread::sleep(Duration::from_millis(1));
+            senders[(round * 7 % 4) as usize].send(round).unwrap();
+            assert_eq!(ack_rx.recv().unwrap(), round);
+        }
+        drop(senders);
+        consumer.join().unwrap();
+    });
+}
+
+/// A sender created while the receiver sleeps starts with its outbox parked, so its first job wakes the receiver even
+/// though the receiver never marked (or saw) that outbox.
+#[test]
+fn a_sender_created_while_the_receiver_sleeps_wakes_it() {
+    within(20, || {
+        let channel = GkTreiberChannel::<u64>::new();
+        let idle = channel.sender().unwrap();
+        let mut receiver = channel.receiver().unwrap();
+        let consumer = thread::spawn(move || receiver.recv().unwrap());
+        // BRANCH: give the consumer time to park on the idle sender alone
+        thread::sleep(Duration::from_millis(100));
+        let mut late = channel.sender().unwrap();
+        late.send(5).unwrap();
+        assert_eq!(consumer.join().unwrap(), 5);
+        drop(idle);
+    });
+}
+
+/// Producers that pause now and then make the receiver park and wake many times while other pushes race the marking.
+/// Every job arrives exactly once, and before any sender is dropped (a dropping sender wakes the receiver too, which
+/// would hide a lost wake-up).
+#[test]
+fn frequent_parking_loses_no_job() {
+    within(60, || {
+        for config in [GkTreiberChannelConfig::DEFAULT, lifo(), GkTreiberChannelConfig::DEFAULT.with_spin_polls(0)] {
+            let channel = GkTreiberChannel::<u64>::with_config(config).unwrap();
+            let mut receiver = channel.receiver().unwrap();
+            let (producers, per) = if cfg!(miri) { (2u64, 20u64) } else { (3, 3_000) };
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let done_rx = Arc::new(std::sync::Mutex::new(done_rx));
+            let handles: Vec<_> = (0..producers)
+                .map(|p| {
+                    let mut sender = channel.sender().unwrap();
+                    let done_rx = done_rx.clone();
+                    thread::spawn(move || {
+                        for i in 0..per {
+                            sender.send(p * per + i).unwrap();
+                            // BRANCH: a pause long enough for the receiver to park
+                            if i % 64 == p {
+                                thread::sleep(Duration::from_micros(50));
+                            }
+                        }
+                        // Keep the sender until everything arrived.
+                        let _ = done_rx.lock().unwrap().recv();
+                    })
+                })
+                .collect();
+            drop(channel);
+            let mut seen = vec![false; (producers * per) as usize];
+            for _ in 0..producers * per {
+                let value = receiver.recv().unwrap();
+                assert!(!std::mem::replace(&mut seen[value as usize], true), "job {value} delivered twice");
+            }
+            drop(done_tx);
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(receiver.recv().unwrap_err(), GkTreiberChannelError::DISCONNECTED);
+        }
+    });
 }

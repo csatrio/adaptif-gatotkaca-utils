@@ -12,7 +12,7 @@ protocols) as shown in [Testing your integration](#testing-your-integration).
 
 | You need | Use | Producer cost | Notes |
 |---|---|---|---|
-| Many threads hand *values* to one thread | `GkTreiberChannel<T>` | one push into a per-thread outbox, no allocation when warm | owns the values; blocking, timeout, `try_recv`, or async receive |
+| Many threads hand *values* to one thread | `GkTreiberChannel<T>` | one `Release` CAS into a per-thread outbox, no allocation when warm | owns the values; blocking, timeout, `try_recv`, or async receive |
 | Many threads hand *intrusive nodes* to one consumer, no wake-up needed | `AtomicPtr<N>` + `GkTreiberPtr` | 1 CAS | the plainest building block |
 | Same, but the consumer **sleeps** (event loop, eventfd, condvar) | `GkParkingStack<N>` | 1 CAS; a wake-up only once per sleep | `push` says when to wake; see the consumer loop recipe |
 | Same, bounded, pushes may be **refused** (HTTP 503) | `GkParkingQueue<N>` | 1 load + 1 `fetch_add` + 1 CAS | exact count: the consumer calls `release(n)` |
@@ -246,9 +246,10 @@ t.join().unwrap();
 
 Producers take a lane (`queue.lane()`, one per producing thread, at most `max_lanes`), push intrusive jobs with
 `unsafe lane.push(NonNull<N>)`; workers call `queue.try_reap()` and iterate the returned chain. The queue never parks:
-your pool does. Before parking a worker, re-check `has_work()`; while `shared_chains() > 0`, park with a timeout of
-about `rescue_after` so stalled chains get rescued. At shutdown, `drain` takes every unrun job. Read the module docs of
-`treiber_channel::mpmc` before writing the pool's park/wake handshake.
+your pool does. Handshake: a producer runs `fence(SeqCst)` after its push, then a relaxed load of the pool's sleeper
+count; a worker records itself there, runs `fence(SeqCst)`, then re-checks `has_work()` before parking. While
+`shared_chains() > 0`, park with a timeout of about `rescue_after` so stalled chains get rescued. At shutdown, `drain`
+takes every unrun job. Read the module docs of `treiber_channel::mpmc` before writing the pool's park/wake handshake.
 
 ### `GkRefCounted` and `FastU64Map`
 

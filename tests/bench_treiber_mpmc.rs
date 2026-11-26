@@ -19,21 +19,35 @@
 //! - blocking: `BLOCKING_JOBS` per producer, every `BLOCK_EVERY`th job sleeps `BLOCK_FOR` (an `fsync` stand-in);
 //!   wall time in milliseconds. The ideal is the total sleep divided by the workers.
 //!
+//! A third test, `bench_mpmc_parking`, runs the queue in a pool whose workers **park** when idle (the runs above
+//! spin), to measure what the module docs' park/wake handshake costs a producer on every push:
+//!
+//! - `rmw`: after each push, a `SeqCst` read-modify-write on the pool's idle count (the module docs' alternative); a
+//!   worker about to park does its own `SeqCst` read-modify-write on it, then `has_work`.
+//! - `fence`: after each push, a `SeqCst` fence and a load of the idle count (the module docs' recipe, tokio's
+//!   pattern); the worker fences between announcing itself and `has_work`.
+//! - `cb channel`: `crossbeam_channel::unbounded`, whose `recv` parks by itself (reference).
+//!
+//! It reports throughput with continuous producers (empty jobs), and push-to-run latency with bursty producers
+//! (`BURSTS` bursts of `BURST` jobs, `BURST_GAP` apart), where workers park between bursts and every burst needs a
+//! wake-up.
+//!
 //! Median of `ROUNDS` runs, each bounded by `RUN_LIMIT`.
 
 // ==== Import Definition ====
 
 use adaptif_gatotkaca_utils::{GkTreiberMpmc, GkTreiberMpmcConfig, TreiberNode};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_utils::{Backoff, CachePadded};
 
 use std::{
     ptr::NonNull,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
         mpsc,
     },
-    thread,
+    thread::{self, Thread},
     time::{Duration, Instant},
 };
 
@@ -48,6 +62,10 @@ const BLOCK_FOR: Duration = Duration::from_millis(1);
 const BLOCKING_SHAPES: [(usize, usize); 3] = [(1, 4), (2, 8), (4, 8)];
 const ROUNDS: usize = 5;
 const RUN_LIMIT: Duration = Duration::from_secs(120);
+const PARKING_SHAPES: [(usize, usize); 4] = [(1, 2), (1, 4), (2, 4), (4, 4)];
+const BURSTS: u64 = 400;
+const BURST: u64 = 16;
+const BURST_GAP: Duration = Duration::from_micros(50);
 
 /// What the producers queue.
 #[derive(Clone, Copy)]
@@ -378,5 +396,306 @@ fn bench_mpmc_blocking() {
         }
         let ideal = (load.total() / BLOCK_EVERY) as f64 * BLOCK_FOR.as_secs_f64() / workers as f64;
         println!("   ideal {:.1}", ideal * 1e3);
+    }
+}
+
+// ==== Parking pool ====
+
+/// How a producer tells the pool about a job it pushed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Notify {
+    Rmw,
+    Fence,
+}
+
+/// The parking contenders.
+#[derive(Clone, Copy)]
+enum Parking {
+    Treiber(Notify),
+    Channel,
+}
+
+const PARKING_KINDS: [Parking; 3] = [Parking::Treiber(Notify::Rmw), Parking::Treiber(Notify::Fence), Parking::Channel];
+
+impl Parking {
+    fn name(self) -> &'static str {
+        // BRANCH: one name per contender
+        match self {
+            Parking::Treiber(Notify::Rmw) => "rmw",
+            Parking::Treiber(Notify::Fence) => "fence",
+            Parking::Channel => "cb channel",
+        }
+    }
+}
+
+/// A job that remembers when it was pushed (nanoseconds since the run's start; 0 when not measured).
+struct TimedJob {
+    next: AtomicPtr<TimedJob>,
+    pushed: u64,
+}
+
+impl TreiberNode for TimedJob {
+    type Value = u64;
+
+    fn next(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
+
+    fn value(&self) -> &u64 {
+        &self.pushed
+    }
+}
+
+// Safety: plain data, owned by whoever holds the box.
+unsafe impl Send for TimedJob {}
+
+/// The pool's sleep state: how many workers are announced asleep (the state word of the handshake) and who they are.
+#[derive(Default)]
+struct Pool {
+    idle: CachePadded<AtomicUsize>,
+    sleepers: Mutex<Vec<Thread>>,
+}
+
+impl Pool {
+    /// Producer side, after each push.
+    #[inline]
+    fn notify(&self, how: Notify) {
+        // BRANCH: the handshake under test
+        let idle = match how {
+            Notify::Rmw => self.idle.fetch_add(0, Ordering::SeqCst),
+            Notify::Fence => {
+                fence(Ordering::SeqCst);
+                self.idle.load(Ordering::Relaxed)
+            }
+        };
+        // BRANCH: a worker is (about to be) asleep
+        if idle > 0 {
+            self.wake_one();
+        }
+    }
+
+    #[cold]
+    fn wake_one(&self) {
+        let sleeper = self.sleepers.lock().unwrap().pop();
+        // BRANCH: another producer woke the last sleeper first
+        if let Some(sleeper) = sleeper {
+            self.idle.fetch_sub(1, Ordering::Relaxed);
+            sleeper.unpark();
+        }
+    }
+
+    fn wake_all(&self) {
+        let sleepers: Vec<Thread> = self.sleepers.lock().unwrap().drain(..).collect();
+        self.idle.fetch_sub(sleepers.len(), Ordering::Relaxed);
+        sleepers.iter().for_each(Thread::unpark);
+    }
+
+    /// Worker side, before the last `has_work`: from here on a producer sees the worker or the worker sees the job.
+    fn announce(&self, how: Notify) {
+        let mut sleepers = self.sleepers.lock().unwrap();
+        sleepers.push(thread::current());
+        self.idle.fetch_add(1, Ordering::SeqCst);
+        drop(sleepers);
+        // BRANCH: the fence variant pairs fences; the RMW variant pairs the two read-modify-writes
+        if how == Notify::Fence {
+            fence(Ordering::SeqCst);
+        }
+    }
+
+    /// Takes the calling worker off the list unless a producer already did (and unparked it).
+    fn withdraw(&self) {
+        let me = thread::current().id();
+        let mut sleepers = self.sleepers.lock().unwrap();
+        // BRANCH: still listed: nobody woke it (it found work, timed out or is leaving)
+        if let Some(index) = sleepers.iter().position(|t| t.id() == me) {
+            sleepers.swap_remove(index);
+            self.idle.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Frees a job taken by a worker and records its push-to-run latency if it was stamped.
+fn take_timed(job: NonNull<TimedJob>, start: Instant, latencies: &mut Vec<u64>) {
+    // Safety: the job is ours now.
+    let job = unsafe { Box::from_raw(job.as_ptr()) };
+    // BRANCH: stamped (bursty load)
+    if job.pushed != 0 {
+        latencies.push(start.elapsed().as_nanos() as u64 - job.pushed);
+    }
+}
+
+/// Pushes a producer's jobs: all at once (`bursty` false) or in bursts with a gap, stamping each job.
+fn produce(jobs: u64, bursty: bool, start: Instant, mut push: impl FnMut(Box<TimedJob>)) {
+    let (bursts, burst) = if bursty { (BURSTS, BURST) } else { (1, jobs) };
+    for _ in 0..bursts {
+        for _ in 0..burst {
+            let pushed = if bursty { start.elapsed().as_nanos() as u64 } else { 0 };
+            push(Box::new(TimedJob { next: AtomicPtr::default(), pushed }));
+        }
+        // BRANCH: let the workers run dry and park
+        if bursty {
+            let until = Instant::now() + BURST_GAP;
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// One run through a parking pool. Returns (seconds, sorted push-to-run latencies in nanoseconds).
+fn parking_run(kind: Parking, producers: usize, workers: usize, bursty: bool) -> (f64, Vec<u64>) {
+    within_limit(move || {
+        let per = if bursty { BURSTS * BURST } else { THROUGHPUT_JOBS };
+        let total = per * producers as u64;
+        let taken = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let latencies: Vec<Vec<u64>> = match kind {
+            Parking::Treiber(how) => {
+                let queue = GkTreiberMpmc::<TimedJob>::new();
+                let rescue_after = queue.config().rescue_after;
+                let pool = Arc::new(Pool::default());
+                let done = Arc::new(AtomicBool::new(false));
+                let lanes: Vec<_> = (0..producers).map(|_| queue.lane().unwrap()).collect();
+                let worker_handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let (queue, pool, done, taken) = (queue.clone(), pool.clone(), done.clone(), taken.clone());
+                        thread::spawn(move || {
+                            let mut latencies = Vec::new();
+                            let backoff = Backoff::new();
+                            loop {
+                                // BRANCH: a chain to run
+                                if let Some(chain) = queue.try_reap() {
+                                    for job in chain {
+                                        take_timed(job, start, &mut latencies);
+                                        taken.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    backoff.reset();
+                                    continue;
+                                }
+                                // BRANCH: spin and yield a little before parking
+                                if !backoff.is_completed() {
+                                    backoff.snooze();
+                                    continue;
+                                }
+                                pool.announce(how);
+                                // BRANCH: a job arrived meanwhile
+                                if queue.has_work() {
+                                    pool.withdraw();
+                                    backoff.reset();
+                                    continue;
+                                }
+                                let stalled = queue.shared_chains() > 0;
+                                // BRANCH: the producers are finished and nothing is left
+                                if done.load(Ordering::Acquire) && !stalled {
+                                    pool.withdraw();
+                                    return latencies;
+                                }
+                                // BRANCH: a shared chain may stall, so look again within `rescue_after`
+                                if stalled {
+                                    thread::park_timeout(rescue_after);
+                                } else {
+                                    thread::park();
+                                }
+                                pool.withdraw();
+                                backoff.reset();
+                            }
+                        })
+                    })
+                    .collect();
+                let producer_handles: Vec<_> = lanes
+                    .into_iter()
+                    .map(|mut lane| {
+                        let pool = pool.clone();
+                        thread::spawn(move || {
+                            produce(per, bursty, start, |job| {
+                                // Safety: a fresh job in no other queue.
+                                unsafe { lane.push(NonNull::from(Box::leak(job))) };
+                                pool.notify(how);
+                            })
+                        })
+                    })
+                    .collect();
+                for handle in producer_handles {
+                    handle.join().unwrap();
+                }
+                done.store(true, Ordering::Release);
+                pool.wake_all();
+                worker_handles.into_iter().map(|h| h.join().unwrap()).collect()
+            }
+            Parking::Channel => {
+                let (tx, rx) = crossbeam_channel::unbounded::<Box<TimedJob>>();
+                let worker_handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let (rx, taken) = (rx.clone(), taken.clone());
+                        thread::spawn(move || {
+                            let mut latencies = Vec::new();
+                            while let Ok(job) = rx.recv() {
+                                take_timed(NonNull::from(Box::leak(job)), start, &mut latencies);
+                                taken.fetch_add(1, Ordering::Relaxed);
+                            }
+                            latencies
+                        })
+                    })
+                    .collect();
+                let producer_handles: Vec<_> = (0..producers)
+                    .map(|_| {
+                        let tx = tx.clone();
+                        thread::spawn(move || produce(per, bursty, start, |job| tx.send(job).unwrap()))
+                    })
+                    .collect();
+                drop(tx);
+                for handle in producer_handles {
+                    handle.join().unwrap();
+                }
+                worker_handles.into_iter().map(|h| h.join().unwrap()).collect()
+            }
+        };
+        let secs = start.elapsed().as_secs_f64();
+        assert_eq!(taken.load(Ordering::Relaxed), total);
+        let mut latencies: Vec<u64> = latencies.into_iter().flatten().collect();
+        latencies.sort_unstable();
+        (secs, latencies)
+    })
+}
+
+fn percentile_us(sorted: &[u64], p: f64) -> f64 {
+    sorted[((sorted.len() - 1) as f64 * p) as usize] as f64 / 1e3
+}
+
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn bench_mpmc_parking() {
+    println!("\nparking pool, continuous producers, empty jobs: millions of jobs per second, median of {ROUNDS}");
+    print!("{:>4} {:>4}", "P", "C");
+    for kind in PARKING_KINDS {
+        print!(" {:>12}", kind.name());
+    }
+    println!();
+    for (producers, workers) in PARKING_SHAPES {
+        print!("{producers:>4} {workers:>4}");
+        for kind in PARKING_KINDS {
+            let secs = median((0..ROUNDS).map(|_| parking_run(kind, producers, workers, false).0).collect());
+            print!(" {:>12.1}", (THROUGHPUT_JOBS * producers as u64) as f64 / secs / 1e6);
+        }
+        println!();
+    }
+    println!(
+        "\nparking pool, bursty producers ({BURSTS} bursts of {BURST}, {BURST_GAP:?} apart): push-to-run latency p50 / p99 in \
+         microseconds, run with the median p50 of {ROUNDS}"
+    );
+    print!("{:>4} {:>4}", "P", "C");
+    for kind in PARKING_KINDS {
+        print!(" {:>16}", kind.name());
+    }
+    println!();
+    for (producers, workers) in PARKING_SHAPES {
+        print!("{producers:>4} {workers:>4}");
+        for kind in PARKING_KINDS {
+            let mut runs: Vec<Vec<u64>> = (0..ROUNDS).map(|_| parking_run(kind, producers, workers, true).1).collect();
+            runs.sort_by_key(|run| run[run.len() / 2]);
+            let run = &runs[ROUNDS / 2];
+            print!(" {:>16}", format!("{:.1} / {:.1}", percentile_us(run, 0.5), percentile_us(run, 0.99)));
+        }
+        println!();
     }
 }
